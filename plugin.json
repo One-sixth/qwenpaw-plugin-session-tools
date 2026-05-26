@@ -1,0 +1,12 @@
+{
+  "id": "qwenpaw-plugin-session-tools",
+  "name": "QwenPaw会话增强工具",
+  "version": "1.1.0",
+  "type": "command",
+  "description": "会话管理工具：/fork、/rewind、/regen",
+  "author": "one-sixth",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "min_qwenpaw_version": "1.1.0"
+}
