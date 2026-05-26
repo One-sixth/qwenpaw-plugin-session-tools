@@ -1,4 +1,4 @@
-# 🛠️ 会话增强工具 (qwenpaw-plugin-session-tools)
+# 🛠️ QwenPaw会话增强工具 (qwenpaw-plugin-session-tools)
 
 为 QwenPaw 提供会话管理能力：**回退对话**、**分叉会话**、**重新生成回复**。
 
@@ -39,7 +39,7 @@ qwenpaw plugin install D:/插件测试/qwenpaw-plugin-session-tools --force
 
 前往QwenPaw的webui中的插件管理，点击安装插件，然后把下载的插件压缩包拖放进去
 
-### 方法二：手动复制到插件目录
+### 方法三：手动复制到插件目录
 
 将 `qwenpaw-plugin-session-tools` 目录复制到插件目录：
 
