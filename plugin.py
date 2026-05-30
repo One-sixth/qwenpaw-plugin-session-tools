@@ -85,15 +85,29 @@ def _get_round_end(messages: list, round_user_idx: int) -> int:
 
 def _try_get_chat_manager():
     """尝试从运行中的 QwenPaw app 获取 chat_manager。"""
+    # 方法1：从 app.state.workspaces 获取（通过上下文变量）
     try:
         from qwenpaw.app.app import app
         from qwenpaw.config.context import get_current_workspace_dir
         ws_dir = get_current_workspace_dir()
-        if ws_dir and ws_dir in app.state.workspaces:
-            ws = app.state.workspaces[ws_dir]
-            return ws.chat_manager
+        if ws_dir:
+            ws_dir_str = str(ws_dir)
+            for key, ws_obj in app.state.workspaces.items():
+                if str(key) == ws_dir_str:
+                    return ws_obj.chat_manager
     except Exception:
         pass
+
+    # 方法2：直接从 workspace 目录构造 ChatManager（fallback）
+    try:
+        from qwenpaw.app.runner.repo.json_repo import JsonChatRepository
+        from qwenpaw.app.runner.manager import ChatManager
+        ws_dir = _get_workspace_dir()
+        repo = JsonChatRepository(ws_dir / "chats.json")
+        return ChatManager(repo=repo)
+    except Exception:
+        pass
+
     return None
 
 
