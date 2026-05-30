@@ -238,7 +238,7 @@
 
   async function handleFork(sessionId, info, msgIndex) {
     var result = await callApi("POST", "/session-tools/session/" + encodeURIComponent(sessionId) + "/fork", {
-      at_message_index: msgIndex,
+      to_message_index: msgIndex,
       user_id: info.user_id,
       channel: info.channel,
     });
