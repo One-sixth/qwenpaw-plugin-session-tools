@@ -174,20 +174,17 @@ async def http_fork(
         with open(new_file, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
 
-        # 尝试注册到 chat_manager，让 WebUI 能看见
+        # 注册到 chat_manager，写入 chats.json 让 WebUI 左侧菜单能看见
         chat_manager = _try_get_chat_manager()
         if chat_manager:
             try:
-                from qwenpaw.app.runner.models import ChatSpec
-                spec = ChatSpec(
-                    name=f"Fork #{to_message_index + 1}",
+                await chat_manager.get_or_create_chat(
                     session_id=new_id,
                     user_id=user_id,
                     channel=channel,
-                    created_at=datetime.now(),
-                    meta={"forked_from": session_id},
+                    name=f"Fork #{to_message_index + 1}",
+                    source="chat",
                 )
-                await chat_manager.create_chat(spec)
             except Exception as e:
                 logger.warning("注册分叉会话到 chat_manager 失败: %s", e)
 
