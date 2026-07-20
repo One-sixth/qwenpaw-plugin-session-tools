@@ -28,18 +28,24 @@ router = APIRouter()
 
 
 def _get_default_workspace_dir() -> Path:
-    """获取默认工作区路径。"""
-    try:
-        from qwenpaw.config.utils import load_config
-        config = load_config()
-        for agent_ref in config.agents:
-            if agent_ref.agent_id == "default":
-                return Path(agent_ref.workspace_dir).expanduser().resolve()
-        if config.agents:
-            return Path(config.agents[0].workspace_dir).expanduser().resolve()
-    except Exception:
-        pass
-    return Path.home() / ".qwenpaw" / "workspaces" / "default"
+    """获取默认工作区路径。
+
+    必须从 QwenPaw 配置中获取，不设兜底路径。
+    参考 qwenpaw-plugin-file-tools 的 get_workspace_dir() 实现。
+    """
+    from qwenpaw.config.utils import load_config
+    from pathlib import Path
+
+    cfg = load_config()
+    profiles = cfg.agents.profiles  # dict[str, AgentProfileRef]
+    if "default" in profiles:
+        ws = profiles["default"].workspace_dir
+        return Path(ws).expanduser().resolve()
+    if profiles:
+        first = next(iter(profiles.values()))
+        ws = first.workspace_dir
+        return Path(ws).expanduser().resolve()
+    raise RuntimeError("无法从 QwenPaw 配置中获取 workspace_dir")
 
 
 def _ensure_operator(workspace_dir: Path) -> SessionOperator:
@@ -276,7 +282,7 @@ async def http_rewind(session_id: str,
             created_at=created_at,
         )
         if file_idx < 0:
-            raise HTTPException(status_code=404, detail=f"未找到消息: created_at={created_at}")
+            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         rewound_message = _get_user_text(target_msg)
         messages = await op.get_messages(session_id, user_id, channel)
@@ -286,8 +292,10 @@ async def http_rewind(session_id: str,
 
         return {"success": True, "deleted": deleted, "remaining": len(new_messages),
                 "rewound_message": rewound_message}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="会话文件未找到")
+        raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except Exception as e:
         logger.exception("回退失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -312,7 +320,7 @@ async def http_regen(session_id: str,
             created_at=created_at,
         )
         if file_idx < 0:
-            raise HTTPException(status_code=404, detail=f"未找到消息: created_at={created_at}")
+            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         messages = await op.get_messages(session_id, user_id, channel)
 
@@ -329,7 +337,7 @@ async def http_regen(session_id: str,
                 break
 
         if user_idx < 0:
-            raise HTTPException(status_code=404, detail="未找到对应的用户消息")
+            raise HTTPException(status_code=404, detail="重新生成失败，未找到对应的用户消息")
 
         # 3. rewind 到用户消息位置（删除该用户消息及之后所有）
         new_messages = messages[:user_idx]
@@ -338,8 +346,10 @@ async def http_regen(session_id: str,
 
         return {"success": True, "deleted": deleted, "remaining": len(new_messages),
                 "rewound_message": user_text}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="会话文件未找到")
+        raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except HTTPException:
         raise
     except Exception as e:
@@ -364,7 +374,7 @@ async def http_fork(session_id: str,
             created_at=created_at,
         )
         if file_idx < 0:
-            raise HTTPException(status_code=404, detail=f"未找到消息: created_at={created_at}")
+            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         messages = await op.get_messages(session_id, user_id, channel)
         truncated = messages[:file_idx + 1]
@@ -417,8 +427,10 @@ async def http_fork(session_id: str,
 
         return {"success": True, "new_session_id": new_id, "messages": len(truncated),
                 "session_name": session_name, "session_path": session_path}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="会话文件未找到")
+        raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except Exception as e:
         logger.exception("分叉失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -441,7 +453,7 @@ async def http_delete_message(session_id: str,
             created_at=created_at,
         )
         if file_idx < 0:
-            raise HTTPException(status_code=404, detail=f"未找到消息: created_at={created_at}")
+            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         messages = await op.get_messages(session_id, user_id, channel)
 
@@ -482,8 +494,10 @@ async def http_delete_message(session_id: str,
 
         await op._update_content(session_id, user_id, channel, new_messages)
         return {"success": True, "deleted": deleted, "remaining": len(new_messages)}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="会话文件未找到")
+        raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except Exception as e:
         logger.exception("删除失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -530,7 +544,7 @@ async def http_get_message(session_id: str,
 
         return {"success": True, "index": file_idx, "message": msg_dict}
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="会话文件未找到")
+        raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except HTTPException:
         raise
     except Exception as e:
@@ -559,7 +573,7 @@ async def http_session_info(session_id: str, user_id: str = Query(default="defau
 
         return {"session_id": session_id, "total_messages": len(messages), "role_counts": role_count}
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="会话文件未找到")
+        raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

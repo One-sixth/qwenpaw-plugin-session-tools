@@ -1,7 +1,7 @@
 {
   "id": "qwenpaw-plugin-session-tools",
   "name": "QwenPaw会话增强工具",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "type": "command",
   "description": "会话管理工具：/fork、/rewind、/regen + WebUI 按钮",
   "author": "one-sixth",

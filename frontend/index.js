@@ -395,19 +395,21 @@
                 nativeSetter.call(inputEl, result.rewound_message || "");
                 inputEl.dispatchEvent(new Event("input", { bubbles: true }));
 
-                // 等 React 更新按钮状态后点击发送
-                setTimeout(function() {
+                // 轮询等待发送按钮可用，最多等 1 秒
+                var maxAttempts = 10;
+                var attempt = 0;
+                (function tryClick() {
                   var sendBtn = document.querySelector("button.qwenpaw-sender-actions-btn");
                   if (sendBtn && !sendBtn.disabled) {
-                    sendBtn.click();
-                    // 发送后 1.5 秒刷新页面
+                    sendBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
                     setTimeout(refreshPage, 1500);
-                  } else if (sendBtn) {
-                    console.log("[" + PLUGIN_NAME + "] 发送按钮仍为禁用状态");
+                  } else if (attempt < maxAttempts) {
+                    attempt++;
+                    setTimeout(tryClick, 100);
                   } else {
-                    console.log("[" + PLUGIN_NAME + "] 未找到发送按钮");
+                    console.log("[" + PLUGIN_NAME + "] 发送按钮在 1 秒内未就绪");
                   }
-                }, 80);
+                })();
               }
             } catch (_) {}
           } else {

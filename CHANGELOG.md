@@ -2,6 +2,18 @@
 
 本文件记录 qwenpaw-plugin-session-tools 的所有重要变更。
 
+## [2.2.0] - 2026-07-20
+
+### Changed
+- 🎯 `find_message_by_created_at` 重写：统一转 Unix 秒数比较，时区修复（`timezone.utc` → `LOCAL_TZ`），先严格匹配再 ±1 秒宽松匹配
+- 📡 报错机制改进：多匹配返回 `409 Conflict`，404 未找到提示"请尝试刷新网页"
+- 💬 报错文案统一风格："定位消息失败，基于 created_at 寻找匹配消息，……"
+- 📂 `_get_default_workspace_dir` 重写：使用 `profiles["default"].workspace_dir`，去掉兜底路径
+- 🔄 regen 按钮：轮询代替 80ms 单次超时，`dispatchEvent` 代替 `.click()`
+
+### Added
+- 🧪 新增 `test_find_message.py`：16 个测试用例覆盖全部核心路径
+
 ## [2.1.0] - 2026-07-12
 
 ### Added

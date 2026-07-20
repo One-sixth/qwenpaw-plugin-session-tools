@@ -83,11 +83,12 @@ session-tools/
 ```
 ctx.data.created_at (Unix秒数 / ISO字符串)
   → 后端 find_message_by_created_at()
-  → 秒级模糊匹配（补 LOCAL_TZ 转本地时间）
+  → 统一转 Unix 秒数，先严格匹配（同一秒），再 ±1 秒宽松匹配
+  → 多匹配时报 409 Conflict，未找到时报 404（提示刷新网页）
   → 返回消息索引 + 消息对象
 ```
 
-**时区处理**：会话文件中的 `created_at` 是无时区本地时间（Asia/Shanghai），Unix 时间戳是 UTC。匹配时给消息时间补 `LOCAL_TZ`（UTC+8），目标时间转本地时间后再比较。
+**时区处理**：会话文件中的 `created_at` 是无时区本地时间（Asia/Shanghai），前端传参可能是 UTC 时间或 Unix 秒数。统一转成 Unix 秒数后比较，彻底绕开时区转换问题。
 
 ### WebUI 按钮
 
@@ -121,7 +122,7 @@ ctx.data.created_at (Unix秒数 / ISO字符串)
 2. 从助手消息向前找对应的用户消息索引 user_idx
 3. messages[:user_idx] 删除整轮
 4. 返回用户消息文本
-5. 前端用 nativeInputValueSetter 填入输入框 → 点击发送按钮
+5. 前端用 nativeInputValueSetter 填入输入框 → 轮询等待发送按钮可用（最多 1 秒）→ 点击发送
 6. 1.5秒后刷新页面
 ```
 
@@ -150,17 +151,17 @@ ctx.data.created_at (Unix秒数 / ISO字符串)
 
 - **运行目录**：`~/.qwenpaw/plugins/qwenpaw-plugin-session-tools/`
 - **插件类型**：`command`
-- **消息定位**：`created_at` 时间戳（秒级模糊匹配）
+- **消息定位**：`created_at` 时间戳统一转 Unix 秒数，先严格匹配（同一秒）再 ±1 秒容差匹配，多匹配时报错
 - **输入框填值**：`nativeInputValueSetter`（React 受控组件兼容）
-- **发送按钮**：`button.qwenpaw-sender-actions-btn`
+- **发送按钮**：`button.qwenpaw-sender-actions-btn`，轮询点击（最多 1 秒）
 - **调试开关**：`localStorage.setItem('SessionTools.debug', 'true')`
 - **多 agent 支持**：`SessionOperator` 按 workspace_dir 缓存
 
 ## 📝 注意事项
 
 - **修改后需要 Ctrl+F5 硬刷新**，浏览器可能缓存旧 JS
-- **`created_at` 精度为秒级**，同秒内多条消息可能匹配不准确
-- **🔄 regen 后 1.5 秒自动刷新**，等待 agent 生成回复
+- **`created_at` 先严格匹配再 ±1 秒容差**，同一秒内多条消息或相近时间多条消息时报 409 Conflict
+- **🔄 regen 后 1.5 秒自动刷新**，等待 agent 生成回复；自动提交改用轮询机制（最多等 1 秒），兼容慢机器
 - **`/noreply` 不会触发 AI 回复**，仅记录用户消息
 
 ## 🧩 依赖

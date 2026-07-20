@@ -161,12 +161,14 @@ class SessionOperator:
         if target_dt.tzinfo is None:
             target_dt = target_dt.replace(tzinfo=timezone.utc)
 
-        # 把目标时间转成本地时间（会话文件中的 created_at 是本地时间）
+        # 把目标时间转成 Unix 秒数
+        target_ts = target_dt.timestamp()
+
         import datetime as _dt_mod
         LOCAL_TZ = _dt_mod.timezone(_dt_mod.timedelta(hours=8), "Asia/Shanghai")
-        target_local = target_dt.astimezone(LOCAL_TZ)
 
-        # 从后往前找，找时间接近的消息（同秒匹配）
+        # 先统一计算所有消息的 Unix 秒数
+        msg_entries = []  # (index, msg, msg_ts)
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
             # 提取 msg dict
@@ -181,24 +183,41 @@ class SessionOperator:
             if msg_ct is None:
                 continue
 
-            # 会话文件中的 created_at 可能是 datetime 或字符串
+            # 会话文件中的 created_at 可能是 datetime 或字符串，统一转成 Unix 秒数
             if isinstance(msg_ct, datetime):
                 if msg_ct.tzinfo is None:
-                    msg_ct = msg_ct.replace(tzinfo=LOCAL_TZ)  # 标记为本地时区！
-                # 比较到秒级
-                if msg_ct.strftime("%Y-%m-%d %H:%M:%S") == target_local.strftime("%Y-%m-%d %H:%M:%S"):
-                    return i, msg
+                    msg_ct = msg_ct.replace(tzinfo=LOCAL_TZ)  # 本地时间！
+                msg_ts = msg_ct.timestamp()
             elif isinstance(msg_ct, str):
                 try:
                     msg_dt = datetime.fromisoformat(msg_ct)
                     if msg_dt.tzinfo is None:
-                        msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-                    if msg_dt.strftime("%Y-%m-%d %H:%M:%S") == target_local.strftime("%Y-%m-%d %H:%M:%S"):
-                        return i, msg
+                        msg_dt = msg_dt.replace(tzinfo=LOCAL_TZ)  # 本地时间！
+                    msg_ts = msg_dt.timestamp()
                 except (ValueError, TypeError):
-                    # 字符串比较直接相等
-                    if msg_ct.strip() == created_at:
-                        return i, msg
+                    continue
+            else:
+                continue
+
+            msg_entries.append((i, msg, msg_ts))
+
+        # 第一轮：严格匹配（同一秒）
+        strict = [(i, m) for i, m, ts in msg_entries if int(ts) == int(target_ts)]
+        if len(strict) == 1:
+            return strict[0]
+        if len(strict) > 1:
+            raise ValueError(
+                "定位消息失败，基于 created_at 寻找匹配消息，发现多个同一时间的匹配"
+            )
+
+        # 第二轮：宽松匹配（±1 秒容差）
+        fuzzy = [(i, m) for i, m, ts in msg_entries if abs(ts - target_ts) <= 1]
+        if len(fuzzy) == 1:
+            return fuzzy[0]
+        if len(fuzzy) > 1:
+            raise ValueError(
+                "定位消息失败，基于 created_at 寻找匹配消息，发现多个相近时间的匹配"
+            )
 
         return -1, None
 
