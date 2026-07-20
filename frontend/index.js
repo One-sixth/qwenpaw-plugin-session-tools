@@ -400,18 +400,26 @@
                 var attempt = 0;
                 (function tryClick() {
                   var sendBtn = document.querySelector("button.qwenpaw-sender-actions-btn");
-                  var found = !!sendBtn;
-                  var disabled = sendBtn ? sendBtn.disabled : true;
-                  console.log("[" + PLUGIN_NAME + "] regen tryClick attempt=" + attempt + " found=" + found + " disabled=" + disabled);
                   if (sendBtn && !sendBtn.disabled) {
-                    console.log("[" + PLUGIN_NAME + "] regen found button, clicking...");
-                    sendBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                    // 先模拟 Enter 键提交（兼容 Chrome 133 等旧版 React 事件系统）
+                    inputEl.dispatchEvent(new KeyboardEvent("keydown", {
+                      key: "Enter",
+                      code: "Enter",
+                      keyCode: 13,
+                      which: 13,
+                      bubbles: true,
+                      cancelable: true,
+                    }));
+                    // 兜底：点击按钮
+                    setTimeout(function() {
+                      sendBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                    }, 50);
                     setTimeout(refreshPage, 1500);
                   } else if (attempt < maxAttempts) {
                     attempt++;
                     setTimeout(tryClick, 100);
                   } else {
-                    console.log("[" + PLUGIN_NAME + "] regen 发送按钮在 1 秒内未就绪");
+                    console.log("[" + PLUGIN_NAME + "] 发送按钮在 1 秒内未就绪");
                   }
                 })();
               }
