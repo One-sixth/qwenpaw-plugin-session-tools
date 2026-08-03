@@ -2,6 +2,14 @@
 
 本文件记录 qwenpaw-plugin-session-tools 的所有重要变更。
 
+## [2.3.0] - 2026-08-03
+
+### Changed
+- 🧭 **多 agent 感知**：HTTP API 的 workspace 路径从固定取 `default` 改为跟随当前 agent（方案 A）
+  - 后端：`_get_default_workspace_dir()` → `_get_workspace_dir(request)`，用官方 `get_agent_for_request` 解析当前 agent（优先级：agent_id 参数 → request.state.agent_id → X-Agent-Id header → active agent）
+  - 6 个 HTTP handler（rewind / regen / fork / delete_message / get_message / session_info）全部增加 `request: Request` 参数
+  - 前端：`callApi` 优先用 `host.fetch`（自动注入 Authorization + X-Agent-Id），兜底原生 fetch 手动加 `X-Agent-Id` header
+- 🐛 修复：非 default agent（如 ChqnR9）网页按钮原先错误访问 default 的 workspace 导致 404，现在与 slash 命令一致，各自用各的 workspace
 ## [2.2.0] - 2026-07-20
 
 ### Changed

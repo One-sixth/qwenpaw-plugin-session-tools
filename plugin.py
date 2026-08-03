@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 
 from agentscope.message import Msg, TextBlock
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from qwenpaw.plugins.api import PluginApi
 
 from .session_ops import SessionOperator, sanitize_filename
@@ -27,25 +27,18 @@ _operators: dict = {}
 router = APIRouter()
 
 
-def _get_default_workspace_dir() -> Path:
-    """获取默认工作区路径。
+async def _get_workspace_dir(request: Request) -> Path:
+    """获取当前请求对应的 agent 工作区路径（多 agent 感知）。
 
-    必须从 QwenPaw 配置中获取，不设兜底路径。
+    通过 QwenPaw 官方 get_agent_for_request 解析当前 agent：
+    优先级依次为 agent_id 参数 → request.state.agent_id → X-Agent-Id header → active agent。
     参考 qwenpaw-plugin-file-tools 的 get_workspace_dir() 实现。
     """
-    from qwenpaw.config.utils import load_config
+    from qwenpaw.app.agent_context import get_agent_for_request
     from pathlib import Path
 
-    cfg = load_config()
-    profiles = cfg.agents.profiles  # dict[str, AgentProfileRef]
-    if "default" in profiles:
-        ws = profiles["default"].workspace_dir
-        return Path(ws).expanduser().resolve()
-    if profiles:
-        first = next(iter(profiles.values()))
-        ws = first.workspace_dir
-        return Path(ws).expanduser().resolve()
-    raise RuntimeError("无法从 QwenPaw 配置中获取 workspace_dir")
+    ws = await get_agent_for_request(request)
+    return Path(ws.workspace_dir).expanduser().resolve()
 
 
 def _ensure_operator(workspace_dir: Path) -> SessionOperator:
@@ -266,7 +259,7 @@ async def _handle_regen_slash(ctx, args: str) -> Msg | None:
 # ── HTTP API ─────────────────────────────────────────────
 
 @router.post("/session/{session_id}/rewind")
-async def http_rewind(session_id: str,
+async def http_rewind(request: Request, session_id: str,
                        user_id: str = Query(...), channel: str = Query(...),
                        created_at: str = Query(...)):
     """回退：按 created_at 定位消息后删除其及之后所有消息。
@@ -274,7 +267,7 @@ async def http_rewind(session_id: str,
     使用 ctx.data.created_at 定位消息，不依赖 message_id。
     """
     try:
-        ws_dir = _get_default_workspace_dir()
+        ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         file_idx, target_msg = await op.find_message_by_created_at(
@@ -302,7 +295,7 @@ async def http_rewind(session_id: str,
 
 
 @router.post("/session/{session_id}/regen")
-async def http_regen(session_id: str,
+async def http_regen(request: Request, session_id: str,
                       user_id: str = Query(...), channel: str = Query(...),
                       created_at: str = Query(...)):
     """重新生成：按 created_at 定位到助手消息，找到对应的用户消息，
@@ -311,7 +304,7 @@ async def http_regen(session_id: str,
     前端将返回的文本填入输入框并发送，触发 agent 重新生成回复。
     """
     try:
-        ws_dir = _get_default_workspace_dir()
+        ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         # 1. 定位到助手消息
@@ -358,7 +351,7 @@ async def http_regen(session_id: str,
 
 
 @router.post("/session/{session_id}/fork")
-async def http_fork(session_id: str,
+async def http_fork(request: Request, session_id: str,
                      user_id: str = Query(...), channel: str = Query(...),
                      created_at: str = Query(...)):
     """分叉：按 created_at 定位消息后分叉新会话。
@@ -366,7 +359,7 @@ async def http_fork(session_id: str,
     使用 ctx.data.created_at 定位消息，不依赖 message_id。
     """
     try:
-        ws_dir = _get_default_workspace_dir()
+        ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         file_idx, target_msg = await op.find_message_by_created_at(
@@ -437,7 +430,7 @@ async def http_fork(session_id: str,
 
 
 @router.delete("/session/{session_id}/message")
-async def http_delete_message(session_id: str,
+async def http_delete_message(request: Request, session_id: str,
                                user_id: str = Query(...), channel: str = Query(...),
                                created_at: str = Query(...)):
     """删除消息：按 created_at 定位消息后删除整轮。
@@ -445,7 +438,7 @@ async def http_delete_message(session_id: str,
     使用 ctx.data.created_at 定位消息，不依赖 message_id。
     """
     try:
-        ws_dir = _get_default_workspace_dir()
+        ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         file_idx, target_msg = await op.find_message_by_created_at(
@@ -504,7 +497,7 @@ async def http_delete_message(session_id: str,
 
 
 @router.get("/session/{session_id}/message")
-async def http_get_message(session_id: str,
+async def http_get_message(request: Request, session_id: str,
                             user_id: str = Query(...), channel: str = Query(...),
                             message_id: str = Query(default=""), created_at: str = Query(default="")):
     """获取消息详情：按 message_id 或 created_at 查找消息，返回完整 JSON。
@@ -516,7 +509,7 @@ async def http_get_message(session_id: str,
         raise HTTPException(status_code=400, detail="至少提供 message_id 或 created_at 参数")
 
     try:
-        ws_dir = _get_default_workspace_dir()
+        ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         if message_id:
@@ -553,11 +546,11 @@ async def http_get_message(session_id: str,
 
 
 @router.get("/session/{session_id}/info")
-async def http_session_info(session_id: str, user_id: str = Query(default="default"),
+async def http_session_info(request: Request, session_id: str, user_id: str = Query(default="default"),
                              channel: str = Query(default="console")):
     """获取会话信息。"""
     try:
-        ws_dir = _get_default_workspace_dir()
+        ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
         messages = await op.get_messages(session_id, user_id, channel)
 

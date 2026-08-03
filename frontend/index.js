@@ -146,6 +146,26 @@
         headers["Authorization"] = "Bearer " + token;
       }
 
+      // 优先使用 host.fetch：自动注入 Authorization + X-Agent-Id，多 agent 感知
+      var host = null;
+      if (window.QwenPaw && window.QwenPaw.host) {
+        host = window.QwenPaw.host;
+      }
+      if (host && typeof host.fetch === "function") {
+        var resp = await host.fetch(url, {
+          method: method,
+          headers: headers,
+        });
+        return await resp.json();
+      }
+
+      // 兜底：原生 fetch + 手动添加 X-Agent-Id 请求头
+      if (host && typeof host.getSelectedAgentId === "function") {
+        var agentId = host.getSelectedAgentId();
+        if (agentId) {
+          headers["X-Agent-Id"] = agentId;
+        }
+      }
       var resp = await fetch(url, {
         method: method,
         headers: headers,
