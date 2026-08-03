@@ -146,20 +146,14 @@
         headers["Authorization"] = "Bearer " + token;
       }
 
-      // 优先使用 host.fetch：自动注入 Authorization + X-Agent-Id，多 agent 感知
+      // 多 agent 感知：用 host.getSelectedAgentId() 实时读取当前选中 agent。
+      // 注意：不能使用 host.fetch —— 它内部会再次拼接 /api 前缀，
+      // 与 getApiUrl() 返回的完整 URL 冲突，导致请求 /api/api/... 失败。
+      // 因此这里用原生 fetch + 手动设置 X-Agent-Id 请求头。
       var host = null;
       if (window.QwenPaw && window.QwenPaw.host) {
         host = window.QwenPaw.host;
       }
-      if (host && typeof host.fetch === "function") {
-        var resp = await host.fetch(url, {
-          method: method,
-          headers: headers,
-        });
-        return await resp.json();
-      }
-
-      // 兜底：原生 fetch + 手动添加 X-Agent-Id 请求头
       if (host && typeof host.getSelectedAgentId === "function") {
         var agentId = host.getSelectedAgentId();
         if (agentId) {
