@@ -155,7 +155,7 @@ ctx.data.created_at (Unix秒数 / ISO字符串)
 - **输入框填值**：`nativeInputValueSetter`（React 受控组件兼容）
 - **发送按钮**：`button.qwenpaw-sender-actions-btn`，轮询点击（最多 1 秒）
 - **调试开关**：`localStorage.setItem('SessionTools.debug', 'true')`
-- **多 agent 支持**：`SessionOperator` 按 workspace_dir 缓存
+- **多 agent 支持**：`SessionOperator` 按 workspace_dir 缓存；HTTP API 的 workspace 解析跟随当前 agent（`get_agent_for_request`，优先级 agent_id → request.state.agent_id → X-Agent-Id → active agent），前端 `callApi` 用原生 fetch + `host.getSelectedAgentId()` 实时设置 `X-Agent-Id` header
 
 ## 📝 注意事项
 
