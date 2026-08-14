@@ -221,84 +221,42 @@ class SessionOperator:
 
         return -1, None
 
-    async def find_message_by_id_or_text(
+    async def find_message_by_id(
         self,
         session_id: str,
         user_id: str,
         channel: str,
-        message_id: str = "",
-        message_text: str = "",
-        role: str = "",
+        msg_id: str = "",
     ) -> tuple[int, Any]:
-        """按消息 ID 或文本内容查找消息。
+        """按消息 ID 查找消息。
 
-        优先按 ID 查找，如果找不到且提供了文本，则按文本匹配。
-        文本匹配时支持指定 role 来缩小范围。
+        按 session 文件中的 msg.id 精确匹配。
+        original_id（前端 ctx.data.metadata.original_id）就是 msg.id，
+        因此该函数同时服务于 original_id 定位。
 
         Args:
             session_id: 会话 ID
             user_id: 用户 ID
             channel: 通道名称
-            message_id: 消息 ID（可选）
-            message_text: 消息文本内容（可选，按文本前缀匹配）
-            role: 角色过滤（可选，如 "user"/"assistant"）
+            msg_id: 消息 ID（对应 msg.id，可选）
 
         Returns:
             tuple[int, Any]: (文件索引, 消息对象)，未找到则返回 (-1, None)
         """
         messages = await self.get_messages(session_id, user_id, channel)
 
-        # 先按 ID 查找
-        if message_id:
-            for i, msg in enumerate(messages):
-                if isinstance(msg, list) and len(msg) > 0 and isinstance(msg[0], dict):
-                    mid = msg[0].get("id", "")
-                    meta = msg[0].get("metadata", {}) or {}
-                elif isinstance(msg, dict):
-                    mid = msg.get("id", "")
-                    meta = msg.get("metadata", {}) or {}
-                else:
-                    continue
-                if mid == message_id:
-                    return i, msg
-                # SSE 流新消息的 _client_id 匹配
-                if isinstance(meta, dict) and meta.get("_client_id") == message_id:
-                    return i, msg
+        if not msg_id:
+            return -1, None
 
-        # 按文本匹配（从后往前找，找最新的匹配消息）
-        if message_text:
-            norm_text = message_text.strip().lower()
-            # 从最新消息开始找
-            for i in range(len(messages) - 1, -1, -1):
-                msg = messages[i]
-                # 检查 role
-                msg_role = ""
-                if isinstance(msg, list) and len(msg) > 0:
-                    msg_role = msg[0].get("role", "")
-                elif isinstance(msg, dict):
-                    msg_role = msg.get("role", "")
-                if role and msg_role != role:
-                    continue
-
-                # 提取文本
-                msg_text = ""
-                if isinstance(msg, list) and len(msg) > 0:
-                    content = msg[0].get("content", "")
-                elif isinstance(msg, dict):
-                    content = msg.get("content", "")
-                else:
-                    continue
-
-                if isinstance(content, str):
-                    msg_text = content.strip().lower()
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            msg_text = block.get("text", "").strip().lower()
-                            break
-
-                if msg_text and (msg_text.startswith(norm_text[:50]) or norm_text.startswith(msg_text[:50])):
-                    return i, msg
+        for i, msg in enumerate(messages):
+            if isinstance(msg, list) and len(msg) > 0 and isinstance(msg[0], dict):
+                mid = msg[0].get("id", "")
+            elif isinstance(msg, dict):
+                mid = msg.get("id", "")
+            else:
+                continue
+            if mid == msg_id:
+                return i, msg
 
         return -1, None
 

@@ -1,17 +1,17 @@
 /**
  * QwenPaw 会话增强工具 — 前端 UI（QwenPaw 2.x 版本）
  *
- * ★ 使用 ctx.data.created_at 时间匹配定位消息，不再依赖消息 ID 或 DOM 索引 ★
+ * ★ 消息定位策略（2026-08-14 增强）：
+ *   优先使用 original_id（精确 UUID 匹配），不可用时回退到 created_at（秒级模糊匹配）
  *
- * 消息定位方案说明（2026-07-12 最终方案）：
- *   - 所有按钮统一使用 ctx.data.created_at 定位消息
- *   - requestActions（用户消息）：ctx.data = {id, created_at, input}
- *   - actions（助手消息）：ctx.data = {data: {output, created_at, completed_at, ...}}
- *   - 后端 find_message_by_created_at() 做秒级模糊匹配（补 LOCAL_TZ 本地时区）
+ * 数据来源：
+ *   - 用户气泡：ctx.data.input[0].metadata.original_id → session 文件 msg.id
+ *   - 助手气泡：ctx.data.output[0].metadata.original_id → session 文件 msg.id
+ *   - 兜底：ctx.data.created_at → find_message_by_created_at()
  *
- * 已废弃方案（保留注释供参考）：
- *   - message_id 注入方案：改 envelope.py / utils.py 注入 msg.id → 前端拿不到
- *   - 文本+时间+邻居三层匹配：Markdown 渲染不一致、时间格式不匹配
+ * 历史方案（已废弃，注释保留供参考）：
+ *   - message_id 注入方案：改 envelope.py / utils.py 注入 msg.id → 前端拿不到（已移除）
+ *   - 文本+时间+邻居三层匹配：Markdown 渲染不一致、时间格式不匹配（已移除）
  */
 
 (function () {
@@ -78,42 +78,28 @@
   }
 
   /**
-   * 直接从 ctx.data.message_id 获取消息 ID
-   * @deprecated 已废弃，所有按钮改用 ctx.data.created_at 定位。
-   *             保留仅供调试参考，不再被任何按钮调用。
+   * 从 ctx.data 中提取 original_id（消息 UUID，对应 session 文件 msg.id）
+   *
+   * 用户气泡：ctx.data.input[0].metadata.original_id
+   * 助手气泡：ctx.data.output[0].metadata.original_id
+   *
+   * 优先使用 original_id 精确匹配，不可用时由调用方回退到 created_at。
+   *
    * @param {Object} ctx - onClick 的上下文对象
-   * @returns {string|null} 消息 ID 或 null
+   * @returns {string|null} original_id 或 null
    */
-  function getMessageId(ctx) {
-    // ★ 调试：打印 ctx.data 的所有 key
-    try {
-      if (ctx && ctx.data) {
-        var keys = Object.keys(ctx.data);
-        var vals = {};
-        keys.forEach(function(k) {
-          var v = ctx.data[k];
-          if (typeof v === 'string') vals[k] = v.substring(0, 40);
-          else vals[k] = typeof v;
-        });
-        console.log('[' + PLUGIN_NAME + '] ctx.data keys:', JSON.stringify(vals));
-      }
-    } catch(e) {
-      console.log('[' + PLUGIN_NAME + '] debug error:', e);
+  function getOriginalId(ctx) {
+    if (!ctx || !ctx.data) return null;
+    var data = ctx.data;
+    // 用户气泡：input[0].metadata.original_id
+    if (data.input && data.input[0] && data.input[0].metadata) {
+      var oid = data.input[0].metadata.original_id;
+      if (oid) return oid;
     }
-
-    // 优先：ctx.data.message_id（actions 的 data 在 mg() 中已注入 message_id）
-    if (ctx && ctx.data && ctx.data.message_id) {
-      return ctx.data.message_id;
-    }
-    // requestActions 的 data: {id, created_at, input} — id 是原始 msg.id
-    // actions 的 response id 是 "response_xxx" 格式，过滤掉
-    if (ctx && ctx.data && ctx.data.id && typeof ctx.data.id === 'string' && ctx.data.id.indexOf('response_') !== 0) {
-      return ctx.data.id;
-    }
-    // actions 兜底：从 output[0] 中取 message_id
-    if (ctx && ctx.data && ctx.data.output && ctx.data.output[0]) {
-      var msg = ctx.data.output[0];
-      if (msg.message_id) return msg.message_id;
+    // 助手气泡：output[0].metadata.original_id
+    if (data.output && data.output[0] && data.output[0].metadata) {
+      var oid = data.output[0].metadata.original_id;
+      if (oid) return oid;
     }
     return null;
   }
@@ -227,12 +213,16 @@
           return;
         }
         var userInfo = getUserSessionInfo();
+        var originalId = getOriginalId(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
         };
+        if (originalId) {
+          params.original_id = originalId;
+        }
 
         callApi("POST", "/session-tools/session/" + encodeURIComponent(sessionId) + "/rewind", params)
           .then(function (result) {
@@ -287,12 +277,16 @@
           return;
         }
         var userInfo = getUserSessionInfo();
+        var originalId = getOriginalId(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
         };
+        if (originalId) {
+          params.original_id = originalId;
+        }
 
         callApi("POST", "/session-tools/session/" + encodeURIComponent(sessionId) + "/fork", params)
           .then(function (result) {
@@ -338,12 +332,16 @@
           return;
         }
         var userInfo = getUserSessionInfo();
+        var originalId = getOriginalId(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
         };
+        if (originalId) {
+          params.original_id = originalId;
+        }
 
         callApi("DELETE", "/session-tools/session/" + encodeURIComponent(sessionId) + "/message", params)
           .then(function (result) {
@@ -386,15 +384,21 @@
           return;
         }
         var userInfo = getUserSessionInfo();
+        var originalId = getOriginalId(ctx);
 
         if (!confirm("确认要重新生成该助手消息吗？")) return;
 
-        callApi("POST", "/session-tools/session/" + encodeURIComponent(sessionId) + "/regen", {
+        var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
-        }).then(function (result) {
+        };
+        if (originalId) {
+          params.original_id = originalId;
+        }
+
+        callApi("POST", "/session-tools/session/" + encodeURIComponent(sessionId) + "/regen", params).then(function (result) {
           if (result && result.success) {
             showToast("🔄 已回退，正在重新发送...", "success");
             // 把文本填入输入框并触发发送
@@ -473,14 +477,20 @@
           return;
         }
         var userInfo = getUserSessionInfo();
+        var originalId = getOriginalId(ctx);
 
         // 调后端 API
-        callApi("GET", "/session-tools/session/" + encodeURIComponent(sessionId) + "/message", {
+        var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
-        }).then(function (result) {
+        };
+        if (originalId) {
+          params.original_id = originalId;
+        }
+
+        callApi("GET", "/session-tools/session/" + encodeURIComponent(sessionId) + "/message", params).then(function (result) {
           if (result && result.success) {
             var msgStr = JSON.stringify(result.message, null, 2);
             // 打开新页签展示
@@ -682,7 +692,7 @@
   }
 
   // ====================================================================
-  // 以下是被新的 message_id 方案替代的旧版文本匹配代码
+  // 以下是被 original_id / created_at 方案替代的旧版文本匹配代码
   // 全部注释保留，方便以后参考
   // ====================================================================
   /*

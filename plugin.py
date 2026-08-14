@@ -5,12 +5,13 @@ QwenPaw 2.x 版本。
 架构说明：
 - 所有命令（/rewind, /fork, /regen）用 register_slash_command() 注册
 - /regen 修改 ctx.input_msgs 后返回 None 让 agent 继续
-- HTTP API 使用 message_id 定位消息（解决虚拟滚动问题）
+- HTTP API 优先使用 original_id（UUID）精确匹配，不可用时回退到 created_at 模糊匹配
 - 通过 SafeJSONSession API 读写会话文件
 """
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from agentscope.message import Msg, TextBlock
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -65,6 +66,56 @@ def _get_user_text(msg: object) -> str:
             if isinstance(block, dict) and block.get("type") == "text":
                 return block.get("text", "")
     return ""
+
+
+async def _locate_message(
+    op: SessionOperator,
+    session_id: str, user_id: str, channel: str,
+    original_id: str = "", created_at: str = "",
+) -> tuple[int, Any]:
+    """定位消息：优先 original_id 精确匹配，回退 created_at 模糊匹配。
+
+    Args:
+        op: SessionOperator 实例
+        session_id: 会话 ID
+        user_id: 用户 ID
+        channel: 通道名称
+        original_id: 消息 UUID（对应 session 文件 msg.id），可选
+        created_at: 时间戳，可选
+
+    Returns:
+        tuple[int, Any]: (文件索引, 消息对象)
+
+    Raises:
+        HTTPException: 400 两个参数都为空，404 未找到
+    """
+    if not original_id and not created_at:
+        raise HTTPException(
+            status_code=400,
+            detail="至少提供 original_id 或 created_at 参数",
+        )
+
+    if original_id:
+        file_idx, target_msg = await op.find_message_by_id(
+            session_id, user_id, channel,
+            msg_id=original_id,
+        )
+    else:
+        file_idx, target_msg = await op.find_message_by_created_at(
+            session_id, user_id, channel,
+            created_at=created_at,
+        )
+
+    if file_idx < 0:
+        detail = "定位消息失败，基于 "
+        if original_id:
+            detail += "original_id 寻找匹配消息"
+        else:
+            detail += "created_at 寻找匹配消息"
+        detail += "，未找到匹配的消息，请尝试刷新网页"
+        raise HTTPException(status_code=404, detail=detail)
+
+    return file_idx, target_msg
 
 
 # ── Slash 命令处理器 ────────────────────────────────────────
@@ -261,21 +312,20 @@ async def _handle_regen_slash(ctx, args: str) -> Msg | None:
 @router.post("/session/{session_id}/rewind")
 async def http_rewind(request: Request, session_id: str,
                        user_id: str = Query(...), channel: str = Query(...),
-                       created_at: str = Query(...)):
-    """回退：按 created_at 定位消息后删除其及之后所有消息。
+                       original_id: str = Query(default=""),
+                       created_at: str = Query(default="")):
+    """回退：按 original_id 或 created_at 定位消息后删除其及之后所有消息。
 
-    使用 ctx.data.created_at 定位消息，不依赖 message_id。
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
     """
     try:
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
-        file_idx, target_msg = await op.find_message_by_created_at(
-            session_id, user_id, channel,
-            created_at=created_at,
+        file_idx, target_msg = await _locate_message(
+            op, session_id, user_id, channel,
+            original_id=original_id, created_at=created_at,
         )
-        if file_idx < 0:
-            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         rewound_message = _get_user_text(target_msg)
         messages = await op.get_messages(session_id, user_id, channel)
@@ -297,10 +347,12 @@ async def http_rewind(request: Request, session_id: str,
 @router.post("/session/{session_id}/regen")
 async def http_regen(request: Request, session_id: str,
                       user_id: str = Query(...), channel: str = Query(...),
-                      created_at: str = Query(...)):
-    """重新生成：按 created_at 定位到助手消息，找到对应的用户消息，
+                      original_id: str = Query(default=""),
+                      created_at: str = Query(default="")):
+    """重新生成：按 original_id 或 created_at 定位到助手消息，找到对应的用户消息，
     回退到用户消息位置（删除该用户消息及之后所有），返回用户消息文本。
 
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
     前端将返回的文本填入输入框并发送，触发 agent 重新生成回复。
     """
     try:
@@ -308,12 +360,10 @@ async def http_regen(request: Request, session_id: str,
         op = _ensure_operator(ws_dir)
 
         # 1. 定位到助手消息
-        file_idx, target_msg = await op.find_message_by_created_at(
-            session_id, user_id, channel,
-            created_at=created_at,
+        file_idx, target_msg = await _locate_message(
+            op, session_id, user_id, channel,
+            original_id=original_id, created_at=created_at,
         )
-        if file_idx < 0:
-            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         messages = await op.get_messages(session_id, user_id, channel)
 
@@ -353,21 +403,20 @@ async def http_regen(request: Request, session_id: str,
 @router.post("/session/{session_id}/fork")
 async def http_fork(request: Request, session_id: str,
                      user_id: str = Query(...), channel: str = Query(...),
-                     created_at: str = Query(...)):
-    """分叉：按 created_at 定位消息后分叉新会话。
+                     original_id: str = Query(default=""),
+                     created_at: str = Query(default="")):
+    """分叉：按 original_id 或 created_at 定位消息后分叉新会话。
 
-    使用 ctx.data.created_at 定位消息，不依赖 message_id。
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
     """
     try:
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
-        file_idx, target_msg = await op.find_message_by_created_at(
-            session_id, user_id, channel,
-            created_at=created_at,
+        file_idx, target_msg = await _locate_message(
+            op, session_id, user_id, channel,
+            original_id=original_id, created_at=created_at,
         )
-        if file_idx < 0:
-            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         messages = await op.get_messages(session_id, user_id, channel)
         truncated = messages[:file_idx + 1]
@@ -432,21 +481,20 @@ async def http_fork(request: Request, session_id: str,
 @router.delete("/session/{session_id}/message")
 async def http_delete_message(request: Request, session_id: str,
                                user_id: str = Query(...), channel: str = Query(...),
-                               created_at: str = Query(...)):
-    """删除消息：按 created_at 定位消息后删除整轮。
+                               original_id: str = Query(default=""),
+                               created_at: str = Query(default="")):
+    """删除消息：按 original_id 或 created_at 定位消息后删除整轮。
 
-    使用 ctx.data.created_at 定位消息，不依赖 message_id。
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
     """
     try:
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
-        file_idx, target_msg = await op.find_message_by_created_at(
-            session_id, user_id, channel,
-            created_at=created_at,
+        file_idx, target_msg = await _locate_message(
+            op, session_id, user_id, channel,
+            original_id=original_id, created_at=created_at,
         )
-        if file_idx < 0:
-            raise HTTPException(status_code=404, detail="定位消息失败，基于 created_at 寻找匹配消息，未找到匹配的消息，请尝试刷新网页")
 
         messages = await op.get_messages(session_id, user_id, channel)
 
@@ -499,23 +547,27 @@ async def http_delete_message(request: Request, session_id: str,
 @router.get("/session/{session_id}/message")
 async def http_get_message(request: Request, session_id: str,
                             user_id: str = Query(...), channel: str = Query(...),
-                            message_id: str = Query(default=""), created_at: str = Query(default="")):
-    """获取消息详情：按 message_id 或 created_at 查找消息，返回完整 JSON。
+                            original_id: str = Query(default=""),
+                            created_at: str = Query(default="")):
+    """获取消息详情：按 original_id 或 created_at 查找消息，返回完整 JSON。
 
-    至少提供 message_id 或 created_at 中的一个参数。
-    优先使用 message_id 查找。
+    至少提供 original_id 或 created_at 中的一个参数。
+    优先使用 original_id，其次 created_at。
     """
-    if not message_id and not created_at:
-        raise HTTPException(status_code=400, detail="至少提供 message_id 或 created_at 参数")
+    if not original_id and not created_at:
+        raise HTTPException(
+            status_code=400,
+            detail="至少提供 original_id 或 created_at 参数",
+        )
 
     try:
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
-        if message_id:
-            file_idx, target_msg = await op.find_message_by_id_or_text(
+        if original_id:
+            file_idx, target_msg = await op.find_message_by_id(
                 session_id, user_id, channel,
-                message_id=message_id,
+                msg_id=original_id,
             )
         else:
             file_idx, target_msg = await op.find_message_by_created_at(
@@ -524,7 +576,7 @@ async def http_get_message(request: Request, session_id: str,
             )
 
         if file_idx < 0 or target_msg is None:
-            detail = f"未找到消息: message_id={message_id}, created_at={created_at}"
+            detail = f"未找到消息: original_id={original_id}, created_at={created_at}"
             raise HTTPException(status_code=404, detail=detail)
 
         # 提取 msg dict（兼容旧格式 [msg_dict, extra] 对）
