@@ -2,6 +2,22 @@
 
 本文件记录 qwenpaw-plugin-session-tools 的所有重要变更。
 
+## [2.4.0] - 2026-08-14
+
+### Added
+- 🎯 **original_id 消息定位增强**：优先使用 `original_id`（UUID）精确匹配消息，不可用时回退到 `created_at` 模糊匹配
+  - 前端：新增 `getOriginalId()`，从 `ctx.data.input[0].metadata.original_id`（用户气泡）或 `ctx.data.output[0].metadata.original_id`（助手气泡）提取，传给 API
+  - 后端：5 个 HTTP handler 增加 `original_id` 参数，新增 `_locate_message()` 统一定位逻辑（original_id → find_message_by_id，回退 created_at → find_message_by_created_at）
+
+### Changed
+- 🧹 `find_message_by_id_or_text()` → `find_message_by_id()`：移除历史残留的文本匹配分支和 `_client_id` 匹配，只保留按 `msg.id` 精确匹配
+- 🧹 删除废弃的 `getMessageId()` 前端函数（读取的 `ctx.data.message_id` / `output[0].message_id` 字段均不存在）
+- 🧹 `http_get_message` 移除无效的 `message_id` Query 参数
+
+### Removed
+- 🗑 移除 `message_id_investigation.md`、`ANALYSIS.md`（message_id 方案已彻底移除，存档文档失去价值）
+- 🗑 移除 `plan_original_id.md`（方案已实施完成）
+
 ## [2.3.0] - 2026-08-03
 
 ### Changed

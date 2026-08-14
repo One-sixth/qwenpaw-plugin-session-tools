@@ -68,7 +68,7 @@ session-tools/
 
 ### 关键设计
 
-- **消息定位**：统一使用 `created_at` 时间戳（秒级模糊匹配），替代旧的 `message_id` 和 DOM 索引方案
+- **消息定位**：优先使用 `original_id`（UUID，对应 session 文件 `msg.id`）精确匹配，不可用时回退到 `created_at` 时间戳秒级模糊匹配
 - **Slash 命令**：通过 `register_slash_command()` 注册，返回 `Msg` 阻止 agent 继续，或返回 `None` 让 agent 继续处理
 - **HTTP API**：提供 RESTful API 供 WebUI 按钮调用
 - **会话操作**：`SessionOperator` 类封装会话文件读写，兼容新旧两种文件格式
@@ -76,16 +76,18 @@ session-tools/
 
 ## ⚙️ 工作原理
 
-### 消息定位：`created_at` 时间匹配
+### 消息定位：`original_id` 优先，`created_at` 回退
 
-所有按钮使用 `ctx.data.created_at` 定位消息，而非 `message_id` 或 DOM 索引：
+所有按钮优先使用 `ctx.data` 中的 `original_id` 精确匹配消息 UUID；旧版 QwenPaw 无 `original_id` 时回退到 `created_at`：
 
 ```
-ctx.data.created_at (Unix秒数 / ISO字符串)
-  → 后端 find_message_by_created_at()
-  → 统一转 Unix 秒数，先严格匹配（同一秒），再 ±1 秒宽松匹配
-  → 多匹配时报 409 Conflict，未找到时报 404（提示刷新网页）
-  → 返回消息索引 + 消息对象
+ctx.data.input[0].metadata.original_id  (用户气泡)  ┐
+ctx.data.output[0].metadata.original_id (助手气泡)  ┴→ 后端 find_message_by_id(msg_id=...)
+                                                    → 按 session 文件 msg.id 精确匹配
+ctx.data.created_at (Unix秒数 / ISO字符串)          ─→ 后端 find_message_by_created_at()
+                                                    → 统一转 Unix 秒数，先严格匹配（同一秒），再 ±1 秒宽松匹配
+多匹配时报 409 Conflict，未找到时报 404（提示刷新网页）
+→ 返回消息索引 + 消息对象
 ```
 
 **时区处理**：会话文件中的 `created_at` 是无时区本地时间（Asia/Shanghai），前端传参可能是 UTC 时间或 Unix 秒数。统一转成 Unix 秒数后比较，彻底绕开时区转换问题。
