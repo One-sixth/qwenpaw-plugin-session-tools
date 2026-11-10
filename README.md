@@ -59,7 +59,7 @@ python scripts/build_release.py
 再用 qwenpaw 命令安装：
 
 ```bash
-qwenpaw plugin install dist/qwenpaw-plugin-session-tools-v2.5.4.zip --force
+qwenpaw plugin install dist/qwenpaw-plugin-session-tools-v2.5.6.zip --force
 ```
 
 **方式二：源码目录**
@@ -68,7 +68,7 @@ qwenpaw plugin install dist/qwenpaw-plugin-session-tools-v2.5.4.zip --force
 qwenpaw plugin install D:\Data\github_repo\qwenpaw-plugin-session-tools --force
 ```
 
-热安装后刷新页面（Ctrl+F5）生效。验证：`qwenpaw plugin list` 应看到「QwenPaw会话增强工具 (v2.5.4)」。
+热安装后刷新页面（Ctrl+F5）生效。验证：`qwenpaw plugin list` 应看到「QwenPaw会话增强工具 (v2.5.6)」。
 
 ## 🏗️ 架构
 
@@ -78,7 +78,8 @@ session-tools/
 ├── plugin.py          # 入口文件：slash 命令 + HTTP API
 ├── session_ops.py     # 核心操作：会话文件读写、消息查找
 ├── scripts/
-│   └── build_release.py  # 打包 zip 安装包
+│   ├── build_release.py    # 打包 zip 安装包
+│   └── drill_real_db.py    # 真库副本演练（回归工具，不动真库）
 ├── frontend/
 │   └── index.js       # WebUI 前端：按钮注册、API 调用
 └── README.md          # 本文件

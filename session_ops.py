@@ -4,8 +4,10 @@
 不再直接操作文件系统。
 """
 
+import asyncio
 import logging
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -26,6 +28,138 @@ TIME_MATCH_TIERS = (1.0, 2.0, 3.0)
 # completed_at 为整秒截断（向下取整），快回复（首段保存距完成 <1s）时
 # 目标可能落进截断缝隙，右边界 +1s 保证覆盖（2026-11-11 v2.5.3 确立）。
 RANGE_END_TOLERANCE = 1.0
+
+
+# ── scroll 簿记继承修复（v2.5.6）─────────────────────────────────────
+#
+# scroll checkpoint（会话文件 agent.scroll）里的「持久化判定位」记录着
+# 父会话已写入 history.db 的行。fork 整文件复制后，宿主 _persist_new
+# 判定这些消息「已持久化」（实际挂的是父 session_id）而全部跳过——
+# fork 会话在 scroll 数据库里看不到任何父历史（2026-11-11 实锤：
+# 11 月 fork 库中 0 行；老 fork 的行是 session-sync 迁移期批量导入的孤例）。
+#
+# 修复组合（fork 时执行）：
+# 1. 清持久化判定位 → 宿主以 fork session_id 重新 write-through context
+# 2. 库行复制 → 父会话全部行（含已驱逐历史）挂 fork session_id，fork 后立即可查
+# 3. index 重映射 → 驱逐索引/目录卡片的 seq 换成 fork 新编号，全程自洽
+
+# scroll checkpoint 中需要清空的「持久化判定位」（宿主 manager.to_dict 的键）。
+SCROLL_PERSIST_KEYS = (
+    "persisted_ids",    # list：已入库的 turn 消息 id
+    "persisted_tcids",  # list：已入库的 tool result id
+    "seq_by_tcid",      # dict：tcid → seq
+    "seq_by_id",        # dict：mid → [seq_lo, seq_hi]
+    "model_turn_seq",   # dict：mid → seq
+    "model_turn_nblk",  # dict：mid → 块数
+    "leaf_by_id",       # dict：mid → [seq, headline]
+)
+
+# 与宿主 scroll/history.py 的 _RECALL_TOOL_NAMES 对齐：recall 工具自身的
+# 调用/结果行按 seq 直接寻址、不进 FTS 全文索引。复制时同样排除。
+RECALL_TOOL_NAMES = ("recall_history", "recall_history_python")
+
+
+
+def _copy_history_rows(db_path: Path, parent_sid: str, fork_sid: str) -> Dict[int, int]:
+    """把父会话在 history.db 的全部行复制到 fork 会话名下（单事务原子）。
+
+    包括已被 scroll 压缩驱逐的历史——它们只存在于库行、不在会话文件里，
+    是「fork 后还能查到压缩前信息」的关键一步。同步补写 FTS 全文索引，
+    行为对齐宿主 HistoryStore.append（recall 工具行排除在索引外）。
+
+    Returns:
+        {旧seq: 新seq} 映射表（按 dedup_key 配对），供驱逐索引重映射。
+
+    Raises:
+        sqlite3.Error / OSError：由调用方降级处理（fork 不因此失败）。
+    """
+    con = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
+    try:
+        cur = con.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            # 幂等防御：fork 名下已有行（此前复制过）则跳过 INSERT，只构建映射
+            cur.execute(
+                "SELECT 1 FROM conversation_history WHERE session_id=? LIMIT 1",
+                (fork_sid,),
+            )
+            if cur.fetchone() is None:
+                cur.execute(
+                    "INSERT INTO conversation_history "
+                    "(session_id, agent_id, kind, role, name, content, tool_call_id, "
+                    " tool_input, tool_state, headline, blocks, metadata, created_at, dedup_key) "
+                    "SELECT ?, agent_id, kind, role, name, content, tool_call_id, "
+                    "       tool_input, tool_state, headline, blocks, metadata, created_at, dedup_key "
+                    "FROM conversation_history WHERE session_id=?",
+                    (fork_sid, parent_sid),
+                )
+                excl = ", ".join("?" for _ in RECALL_TOOL_NAMES)
+                cur.execute(
+                    "INSERT INTO conversation_history_fts(rowid, content) "
+                    "SELECT seq, COALESCE(content, '') FROM conversation_history "
+                    f"WHERE session_id=? AND (name IS NULL OR name NOT IN ({excl}))",
+                    (fork_sid, *RECALL_TOOL_NAMES),
+                )
+            # 旧→新 seq 映射：按 dedup_key 配对（会话内唯一，宿主 ux_dedup
+            # UNIQUE）。NULL dedup_key 行不参与——宿主写路径从不产生 NULL
+            # dedup_key（turn 的 mid、tool result 的 tcid/{mid}#anon{n} 恒非空）
+            old = dict(cur.execute(
+                "SELECT dedup_key, seq FROM conversation_history "
+                "WHERE session_id=? AND dedup_key IS NOT NULL", (parent_sid,)))
+            new = dict(cur.execute(
+                "SELECT dedup_key, seq FROM conversation_history "
+                "WHERE session_id=? AND dedup_key IS NOT NULL", (fork_sid,)))
+            seq_map = {old[ok]: new[ok] for ok in old.keys() & new.keys()}
+            con.commit()
+            return seq_map
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass  # rollback 失败不掩盖原始异常
+            raise
+    finally:
+        con.close()
+
+
+def _remap_scroll_index(scroll: Dict, seq_map: Dict[int, int], fork_sid: str) -> int:
+    """把 scroll.index 里的父会话 seq 重映射为 fork 会话的新 seq。
+
+    index 结构（宿主 eviction_index.to_dict）：
+    tiers → blocks → {seq_lo, seq_hi, lines: [[lo, hi, head, tail], ...]}。
+    宿主 restore 后以此重建内存索引，首次压缩重渲染目录卡片时全部使用
+    fork 自己的编号。无映射的 seq（如被 retention purge 的行）保留原值。
+    返回重映射的点数（诊断用）。
+    """
+    if not seq_map:
+        return 0
+    index = scroll.get("index")
+    if not isinstance(index, dict):
+        return 0
+    touched = 0
+    tiers = index.get("tiers") or index.get("levels") or []
+    for tier in tiers:
+        if not isinstance(tier, list):
+            continue
+        for block in tier:
+            if not isinstance(block, dict):
+                continue
+            for key in ("seq_lo", "seq_hi"):
+                if block.get(key) in seq_map:
+                    block[key] = seq_map[block[key]]
+                    touched += 1
+            for line in block.get("lines") or []:
+                # 病态数据防御（跨版本持久化结构）：短行/非序列跳过，
+                # 避免单个坏行让整个重映射中途放弃（留下混合态索引）
+                if not (isinstance(line, (list, tuple)) and len(line) >= 2):
+                    continue
+                for i in (0, 1):
+                    if line[i] in seq_map:
+                        line[i] = seq_map[line[i]]
+                        touched += 1
+    index["session_id"] = fork_sid
+    return touched
+
 
 
 def find_turn_user(messages: list, idx: int) -> int:
@@ -468,7 +602,50 @@ class SessionOperator:
                     proxy.data["memory"]["content"] = messages
                 else:
                     proxy.data["state"]["context"] = messages
+                # scroll 簿记继承修复（v2.5.6）：清持久化判定位，防止宿主
+                # _persist_new 误判「已持久化」（实际挂父 session_id）而
+                # 跳过写入。old fmt 无 scroll 键，天然跳过。
+                scroll = proxy.data.get("scroll")
+                if isinstance(scroll, dict):
+                    for persist_key in SCROLL_PERSIST_KEYS:
+                        scroll.pop(persist_key, None)
             modules[module_name] = proxy
+
+        # 库行复制 + index 重映射（v2.5.6）：把父会话在 history.db 的全部行
+        # （含已被压缩驱逐、不在 context 里的历史）复制到 fork 名下，让
+        # 压缩前信息 fork 后依然可查；驱逐索引 seq 同步换成 fork 新编号。
+        # 失败降级为纯文件 fork（仅 context 部分由 write-through 修复），
+        # 不阻塞 fork 本身。
+        scroll = None
+        agent_mod = modules.get("agent")
+        if agent_mod is not None and isinstance(agent_mod.data, dict):
+            scroll = agent_mod.data.get("scroll")
+        if isinstance(scroll, dict):
+            db_path = self.workspace_dir / "history.db"
+            if db_path.exists():
+                try:
+                    seq_map = await asyncio.to_thread(
+                        _copy_history_rows, db_path, source_id, new_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "fork: history.db 行复制失败，降级为纯文件 fork"
+                        "（被驱逐历史将不可查）: %s", e,
+                    )
+                else:
+                    try:
+                        remapped = _remap_scroll_index(scroll, seq_map, new_id)
+                        logger.info(
+                            "fork: history.db 行已复制 %s → %s"
+                            "（%d 行，index 重映射 %d 点）",
+                            source_id, new_id, len(seq_map), remapped,
+                        )
+                    except Exception as e:
+                        # 行已复制提交，仅重映射失败——索引功能良性
+                        #（父 seq 与 fork seq 指向内容相同的真实行），日志区分
+                        logger.warning(
+                            "fork: index 重映射失败（行已复制、历史仍可查）: %s", e,
+                        )
 
         await self.session.save_session_state(
             session_id=new_id,

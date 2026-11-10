@@ -832,3 +832,416 @@ class TestCoverageHoles:
         )
         assert idx == -1
         assert msg is None
+
+
+# ======================================================================
+# scroll 簿记继承修复（v2.5.6）
+# ======================================================================
+
+import sqlite3
+
+from session_ops import (
+    SCROLL_PERSIST_KEYS,
+    RECALL_TOOL_NAMES,
+    _copy_history_rows,
+    _remap_scroll_index,
+)
+
+_DB_SCHEMA = """
+CREATE TABLE conversation_history (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL,
+    agent_id     TEXT,
+    kind         TEXT NOT NULL,
+    role         TEXT,
+    name         TEXT,
+    content      TEXT,
+    tool_call_id TEXT,
+    tool_input   TEXT,
+    tool_state   TEXT,
+    headline     TEXT,
+    blocks       TEXT,
+    metadata     TEXT,
+    created_at   TEXT,
+    dedup_key    TEXT
+);
+CREATE UNIQUE INDEX ux_dedup ON conversation_history(session_id, dedup_key);
+CREATE VIRTUAL TABLE conversation_history_fts USING fts5(
+    content, content='conversation_history', content_rowid='seq'
+);
+"""
+
+
+def _make_db(path, parent_sid, n_normal=3, n_recall=1):
+    """建临时 history.db：父会话 n_normal 条普通行 + n_recall 条 recall 工具行。"""
+    con = sqlite3.connect(str(path))
+    con.executescript(_DB_SCHEMA)
+    for i in range(n_normal):
+        con.execute(
+            "INSERT INTO conversation_history "
+            "(session_id, kind, role, name, content, dedup_key, created_at) "
+            "VALUES (?, 'model_turn', 'user', 'user', ?, ?, ?)",
+            (parent_sid, f"content-{i}", f"dk-{i}", f"2026-11-11T00:00:0{i}"),
+        )
+    for i in range(n_recall):
+        con.execute(
+            "INSERT INTO conversation_history "
+            "(session_id, kind, role, name, content, dedup_key, created_at) "
+            "VALUES (?, 'context_msg', 'tool', 'recall_history', ?, ?, ?)",
+            (parent_sid, f"recall-{i}", f"recall-dk-{i}", f"2026-11-11T00:01:0{i}"),
+        )
+    con.commit()
+    con.close()
+
+
+def _make_scroll_state(parent_sid: str) -> dict:
+    """构造带 scroll checkpoint 的会话 state（含已被压缩驱逐的 index）。"""
+    return {
+        "session_id": parent_sid,
+        "agent": {
+            "state": {"context": [make_msg("2026-11-11T00:00:00", idx=99)]},
+            "scroll": {
+                "token_estimate": {"margin": 0, "model_key": "test", "context_size": 1000},
+                "persisted_ids": ["a", "b"],
+                "persisted_tcids": ["call_1"],
+                "seen_tool_result_ids": ["call_1"],
+                "seen_thinking_block_ids": ["t1"],
+                "folded_thinking_block_ids": [],
+                "seq_by_tcid": {"call_1": 2},
+                "synthetic_ids": [],
+                "seq_by_id": {"a": [1, 1], "b": [2, 2]},
+                "model_turn_seq": {"a": 1, "b": 2},
+                "model_turn_nblk": {"a": 1, "b": 2},
+                "leaf_by_id": {"a": [1, "headline-a"]},
+                # index 指向父会话库行的 seq（1~2 在父行范围内）
+                "index": {
+                    "session_id": parent_sid,
+                    "agent_id": "default",
+                    "tiers": [
+                        [
+                            {
+                                "seq_lo": 1,
+                                "seq_hi": 2,
+                                "lines": [[1, 1, "head-a", "head-a"]],
+                            }
+                        ]
+                    ],
+                },
+                "continuation_summary": None,
+                "summary_update_failed": False,
+            },
+        },
+    }
+
+
+class TestCopyHistoryRows:
+    """_copy_history_rows：库行复制 / FTS 排除 / 幂等 / 映射表"""
+
+    def test_copy_and_seq_map(self, tmp_path):
+        db = tmp_path / "history.db"
+        _make_db(db, "parent-sid", n_normal=3, n_recall=1)
+        seq_map = _copy_history_rows(db, "parent-sid", "fork-fid")
+        con = sqlite3.connect(str(db))
+        # fork 名下 4 行（3 普通 + 1 recall，recall 行也复制——只是不进 FTS）
+        assert con.execute(
+            "SELECT COUNT(*) FROM conversation_history WHERE session_id='fork-fid'"
+        ).fetchone()[0] == 4
+        # 映射表覆盖全部有 dedup_key 的行
+        assert len(seq_map) == 4
+        # 新旧 seq 不重叠（AUTOINCREMENT 续接）
+        assert set(seq_map.values()).isdisjoint(set(seq_map.keys()))
+        # FTS：recall 工具行排除，普通行在。
+        # ⚠️ 不能用 SELECT rowid FROM fts 判断——external content 全扫描会
+        # 回读主表（父行未入索引也会出现）；用 fts_docsize（与宿主
+        # history.py:504 判索引方式一致）
+        fts_rows = {
+            r[0] for r in con.execute("SELECT id FROM conversation_history_fts_docsize")
+        }
+        fork_recall = con.execute(
+            "SELECT seq FROM conversation_history WHERE session_id='fork-fid' AND dedup_key='recall-dk-0'"
+        ).fetchone()[0]
+        fork_normal = con.execute(
+            "SELECT seq FROM conversation_history WHERE session_id='fork-fid' AND dedup_key='dk-0'"
+        ).fetchone()[0]
+        assert fork_recall not in fts_rows
+        assert fork_normal in fts_rows
+        con.close()
+
+    def test_idempotent_second_call(self, tmp_path):
+        db = tmp_path / "history.db"
+        _make_db(db, "parent-sid", n_normal=3, n_recall=1)
+        _copy_history_rows(db, "parent-sid", "fork-fid")
+        seq_map2 = _copy_history_rows(db, "parent-sid", "fork-fid")
+        con = sqlite3.connect(str(db))
+        # 二次调用跳过 INSERT，行数不翻倍；映射表仍完整
+        assert con.execute(
+            "SELECT COUNT(*) FROM conversation_history WHERE session_id='fork-fid'"
+        ).fetchone()[0] == 4
+        assert len(seq_map2) == 4
+        con.close()
+
+    def test_parent_missing_rows_empty_map(self, tmp_path):
+        db = tmp_path / "history.db"
+        _make_db(db, "other-sid")
+        seq_map = _copy_history_rows(db, "parent-sid", "fork-fid")
+        assert seq_map == {}
+        con = sqlite3.connect(str(db))
+        assert con.execute(
+            "SELECT COUNT(*) FROM conversation_history WHERE session_id='fork-fid'"
+        ).fetchone()[0] == 0
+        con.close()
+
+
+class TestRemapScrollIndex:
+    """_remap_scroll_index：index seq 重映射 / 保留键不动 / 空映射安全"""
+
+    def _scroll(self):
+        return _make_scroll_state("parent-sid")["agent"]["scroll"]
+
+    def test_remap_all_points(self, tmp_path):
+        db = tmp_path / "history.db"
+        _make_db(db, "parent-sid", n_normal=3, n_recall=1)
+        seq_map = _copy_history_rows(db, "parent-sid", "fork-fid")
+        scroll = self._scroll()
+        touched = _remap_scroll_index(scroll, seq_map, "fork-fid")
+        idx = scroll["index"]
+        assert idx["session_id"] == "fork-fid"
+        block = idx["tiers"][0][0]
+        # seq_lo=1, seq_hi=2 都有映射 → 换成 fork 新 seq
+        assert block["seq_lo"] == seq_map[1]
+        assert block["seq_hi"] == seq_map[2]
+        # lines 的 [lo, hi, head, tail] 前两位重映射，head/tail 不动
+        line = block["lines"][0]
+        assert line[0] == seq_map[1]
+        assert line[2] == "head-a"
+        assert touched >= 3  # seq_lo + seq_hi + line lo + line hi 中可映射项
+
+    def test_unmapped_seq_kept(self):
+        scroll = self._scroll()
+        # 空映射 → 原样保留
+        touched = _remap_scroll_index(scroll, {}, "fork-fid")
+        assert touched == 0
+        assert scroll["index"]["tiers"][0][0]["seq_lo"] == 1
+
+    def test_no_index_safe(self):
+        scroll = {"persisted_ids": []}
+        assert _remap_scroll_index(scroll, {1: 9}, "fork-fid") == 0
+
+
+class TestForkScrollInheritance:
+    """fork 端到端：簿记清空 + 保留键原样 + 库行复制 + index 重映射"""
+
+    @pytest.mark.asyncio
+    async def test_fork_full_chain(self, tmp_path):
+        db = tmp_path / "history.db"
+        _make_db(db, "parent-sid", n_normal=3, n_recall=1)
+
+        op = SessionOperator.__new__(SessionOperator)
+        op.workspace_dir = tmp_path
+        op.session = MagicMock()
+        op.session.get_session_state_dict = AsyncMock(
+            return_value=_make_scroll_state("parent-sid")
+        )
+        saved = {}
+
+        async def fake_save(session_id, user_id="", channel="", **modules):
+            saved["sid"] = session_id
+            saved["modules"] = modules
+
+        op.session.save_session_state = fake_save
+
+        new_id = await op.fork(
+            "parent-sid", "uid", "console", 0,
+            messages=[make_msg("2026-11-11T00:00:00", idx=99)],
+            new_id="fork-fid",
+        )
+        assert new_id == "fork-fid"
+        assert saved["sid"] == "fork-fid"
+
+        scroll = saved["modules"]["agent"].data["scroll"]
+        # 持久化判定位全部清除
+        for key in SCROLL_PERSIST_KEYS:
+            assert key not in scroll, f"{key} 应被清除"
+        # 折叠状态 / 合成占位符 / token 估算 / summary 标记保留
+        assert scroll["seen_tool_result_ids"] == ["call_1"]
+        assert scroll["seen_thinking_block_ids"] == ["t1"]
+        assert scroll["folded_thinking_block_ids"] == []
+        assert scroll["synthetic_ids"] == []
+        assert scroll["token_estimate"]["context_size"] == 1000
+        assert scroll["summary_update_failed"] is False
+        # index 重映射为 fork 新 seq
+        assert scroll["index"]["session_id"] == "fork-fid"
+
+        # 库行复制生效
+        con = sqlite3.connect(str(db))
+        assert con.execute(
+            "SELECT COUNT(*) FROM conversation_history WHERE session_id='fork-fid'"
+        ).fetchone()[0] == 4
+        con.close()
+
+    @pytest.mark.asyncio
+    async def test_fork_db_failure_degrades(self, tmp_path):
+        """history.db 复制失败（库不存在/坏表）→ fork 照常完成，簿记仍清空"""
+        op = SessionOperator.__new__(SessionOperator)
+        op.workspace_dir = tmp_path  # 无 history.db 文件 → db_path.exists() False
+        op.session = MagicMock()
+        op.session.get_session_state_dict = AsyncMock(
+            return_value=_make_scroll_state("parent-sid")
+        )
+        saved = {}
+
+        async def fake_save(session_id, user_id="", channel="", **modules):
+            saved["modules"] = modules
+
+        op.session.save_session_state = fake_save
+
+        new_id = await op.fork(
+            "parent-sid", "uid", "console", 0,
+            messages=[make_msg("2026-11-11T00:00:00", idx=99)],
+            new_id="fork-fid",
+        )
+        assert new_id == "fork-fid"
+        scroll = saved["modules"]["agent"].data["scroll"]
+        for key in SCROLL_PERSIST_KEYS:
+            assert key not in scroll
+        # index 未重映射（保留父值），但不阻塞 fork
+        assert scroll["index"]["session_id"] == "parent-sid"
+
+    @pytest.mark.asyncio
+    async def test_fork_old_format_no_scroll(self, tmp_path):
+        """old fmt（无 scroll 键）→ 不炸、照常 fork"""
+        state = {
+            "session_id": "parent-sid",
+            "agent": {"memory": {"content": [make_old_msg("2026-11-11T00:00:00")]}},
+        }
+        op = SessionOperator.__new__(SessionOperator)
+        op.workspace_dir = tmp_path
+        op.session = MagicMock()
+        op.session.get_session_state_dict = AsyncMock(return_value=state)
+        saved = {}
+
+        async def fake_save(session_id, user_id="", channel="", **modules):
+            saved["modules"] = modules
+
+        op.session.save_session_state = fake_save
+
+        new_id = await op.fork(
+            "parent-sid", "uid", "console", 0,
+            messages=[make_old_msg("2026-11-11T00:00:00")],
+            new_id="fork-fid",
+        )
+        assert new_id == "fork-fid"
+        assert "scroll" not in saved["modules"]["agent"].data
+
+
+class TestForkDegradePaths:
+    """复审补充（v2.5.6）：真实降级路径覆盖——库坏/数据病态时 fork 不阻塞"""
+
+    @pytest.mark.asyncio
+    async def test_fork_broken_db_degrades(self, tmp_path):
+        """表存在但 FTS 虚表缺失（宿主 schema 变更模拟）→ sqlite3.Error →
+        fork 照常完成、index 未重映射（与 A 复审员指出的零覆盖路径对应）"""
+        db = tmp_path / "history.db"
+        con = sqlite3.connect(str(db))
+        # 只建主表，不建 FTS 表
+        con.executescript(_DB_SCHEMA.split("CREATE VIRTUAL TABLE")[0])
+        con.execute(
+            "INSERT INTO conversation_history "
+            "(session_id, kind, role, name, content, dedup_key, created_at) "
+            "VALUES ('parent-sid', 'model_turn', 'user', 'user', 'c', 'dk-0', 't')"
+        )
+        con.commit()
+        con.close()
+
+        op = SessionOperator.__new__(SessionOperator)
+        op.workspace_dir = tmp_path
+        op.session = MagicMock()
+        op.session.get_session_state_dict = AsyncMock(
+            return_value=_make_scroll_state("parent-sid")
+        )
+        saved = {}
+
+        async def fake_save(session_id, user_id="", channel="", **modules):
+            saved["modules"] = modules
+
+        op.session.save_session_state = fake_save
+
+        new_id = await op.fork(
+            "parent-sid", "uid", "console", 0,
+            messages=[make_msg("2026-11-11T00:00:00", idx=99)],
+            new_id="fork-fid",
+        )
+        assert new_id == "fork-fid"  # fork 本身不失败
+        scroll = saved["modules"]["agent"].data["scroll"]
+        # 复制失败 → index 未重映射（保留父值），但簿记清空已生效
+        assert scroll["index"]["session_id"] == "parent-sid"
+
+    @pytest.mark.asyncio
+    async def test_fork_duplicate_dedup_key_degrades(self, tmp_path):
+        """父库存在重复 dedup_key（绕过唯一约束写入的病态数据）→
+        INSERT SELECT 撞 ux_dedup → sqlite3.IntegrityError → fork 降级不阻塞"""
+        db = tmp_path / "history.db"
+        con = sqlite3.connect(str(db))
+        con.executescript(_DB_SCHEMA.split("CREATE VIRTUAL TABLE")[0])
+        # 手动写两行同 (session_id, dedup_key) —— 先关索引模拟脏数据
+        con.execute("DROP INDEX ux_dedup")
+        for i in range(2):
+            con.execute(
+                "INSERT INTO conversation_history "
+                "(session_id, kind, role, name, content, dedup_key, created_at) "
+                "VALUES ('parent-sid', 'model_turn', 'user', 'user', ?, 'dup-0', ?)",
+                (f"c{i}", f"t{i}"),
+            )
+        con.commit()
+        con.close()
+
+        op = SessionOperator.__new__(SessionOperator)
+        op.workspace_dir = tmp_path
+        op.session = MagicMock()
+        op.session.get_session_state_dict = AsyncMock(
+            return_value=_make_scroll_state("parent-sid")
+        )
+        saved = {}
+
+        async def fake_save(session_id, user_id="", channel="", **modules):
+            saved["modules"] = modules
+
+        op.session.save_session_state = fake_save
+
+        new_id = await op.fork(
+            "parent-sid", "uid", "console", 0,
+            messages=[make_msg("2026-11-11T00:00:00", idx=99)],
+            new_id="fork-fid",
+        )
+        assert new_id == "fork-fid"  # 降级：fork 照常完成
+        scroll = saved["modules"]["agent"].data["scroll"]
+        assert scroll["index"]["session_id"] == "parent-sid"  # 未重映射
+
+
+class TestRemapMalformedIndex:
+    """复审补充（v2.5.6）：index 病态结构防御（A 复审员 P2-1）"""
+
+    def test_short_line_skipped(self):
+        """lines 元素短于 2 位 → 跳过不崩，其余行照常重映射"""
+        scroll = {
+            "index": {
+                "session_id": "p",
+                "tiers": [[
+                    {"seq_lo": 1, "seq_hi": 2,
+                     "lines": [[10], 11, None, ["x"], [1, 2, "head", "tail"]]},
+                ]],
+            }
+        }
+        touched = _remap_scroll_index(scroll, {1: 100, 2: 200}, "f")
+        block = scroll["index"]["tiers"][0][0]
+        assert block["seq_lo"] == 100 and block["seq_hi"] == 200
+        # [10] 太短跳过；11 非 list 跳过；None 跳过；["x"] 太短跳过
+        assert block["lines"][4] == [100, 200, "head", "tail"]
+        assert touched == 4  # seq_lo + seq_hi + 好行的 lo/hi
+
+    def test_tiers_none_and_bad_tier(self):
+        """tiers 为 None / tier 非 list → 不崩返回 0"""
+        scroll = {"index": {"session_id": "p", "tiers": None}}
+        assert _remap_scroll_index(scroll, {1: 2}, "f") == 0
+        scroll = {"index": {"session_id": "p", "tiers": [None, "x"]}}
+        assert _remap_scroll_index(scroll, {1: 2}, "f") == 0

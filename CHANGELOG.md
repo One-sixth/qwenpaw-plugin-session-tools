@@ -2,6 +2,42 @@
 
 本文件记录 qwenpaw-plugin-session-tools 的所有重要变更。
 
+## [2.5.6] - 2026-11-11
+
+### Added
+- 🧬 **fork 后新会话在 scroll 数据库可查父历史（含已压缩驱逐部分）**：修复 fork 继承
+  父会话 scroll 簿记导致宿主 `_persist_new` 误判「已持久化」（实际挂父 session_id）
+  而全部跳过——fork 会话在 history.db 中零历史行（2026-11-11 调查实锤）。三步组合：
+  1. **清持久化判定位**（`SCROLL_PERSIST_KEYS` 7 键）→ 宿主以 fork session_id 重新
+     write-through context；
+  2. **库行复制**（`_copy_history_rows`，单事务 `BEGIN IMMEDIATE` 原子）→ 父会话全部
+     行（含已被压缩驱逐、不在 context 里的历史）挂 fork session_id，fork 后立即可查；
+     同步补写 FTS（recall 工具行排除，对齐宿主 history.py `_RECALL_TOOL_NAMES`）；
+  3. **index 重映射**（`_remap_scroll_index`）→ 驱逐索引 seq 按「旧→新」对照表换成
+     fork 新编号，后续压缩的目录卡片全程自洽。
+- 🧪 测试 52 → 61 用例：库行复制/FTS 排除/幂等/映射表、index 重映射、fork 端到端
+  （真临时 DB）、降级路径（库缺失/坏表不阻塞 fork）、old fmt 无 scroll 防御。
+- 🔧 `scripts/drill_real_db.py`：真库副本演练脚本（回归工具，不动真库）。
+
+### Fixed（三子 agent 交叉复审修复，61 → 65 用例）
+- 🛡️ `_remap_scroll_index` 病态数据防御（复审 A P2-1）：lines 短行/非序列/tier 非 list
+  跳过不崩，避免单个坏行让重映射中途放弃留下混合态索引。
+- 🧪 补真实降级路径覆盖（复审 C P2×2）：表存在但 FTS 虚表缺失 → fork 降级不阻塞；
+  重复 dedup_key（脏数据撞 ux_dedup）→ fork 降级不阻塞；测试 schema 对齐真库
+  （表级 UNIQUE 改独立 ux_dedup 索引）。
+- 📝 复制/重映射失败日志区分（复审 A P3-1）：重映射失败时行已提交、历史仍可查，
+  不再误报为「复制失败」；rollback 失败不再掩盖原始异常（P3-2）。
+- 📝 README 安装示例 2.5.4 → 2.5.6 + 架构图补 drill 脚本（复审 C P3）。
+- 🔧 drill 脚本改 sqlite3 backup API 一致性快照（复审 C P3）：WAL 活跃时 copy2
+  三件套可能得到不配套数据页。
+- 📝 NULL dedup_key 注释措辞修正（复审 B）：宿主写路径从不产生 NULL dedup_key
+  （复审 B 对宿主 10 项假设全部验证成立，零发现）。
+
+### Notes
+- 复制失败降级为纯文件 fork（context 部分仍由 write-through 修复），日志 WARNING。
+- 依赖宿主 history.db schema（14 列 + external content FTS5），宿主大版本升级
+  schema 变更时需同步。真库演练实测 1840 行复制 392ms。
+
 ## [2.5.5] - 2026-11-11
 
 ### Fixed
