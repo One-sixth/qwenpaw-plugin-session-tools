@@ -4,7 +4,6 @@
 不再直接操作文件系统。
 """
 
-import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -17,6 +16,43 @@ logger = logging.getLogger(__name__)
 def sanitize_filename(name: str) -> str:
     """将文件名中的非法字符替换为 '--'，确保跨平台兼容。"""
     return re.sub(r'[\\/:*?"<>|]', '--', name)
+
+
+# created_at 渐进窗口匹配的时间层（秒），±1s 优先命中、逐层放宽到 ±3s。
+# user 端：前端气泡时间戳与后端写盘时间常有 1~3 秒漂移（2026-11-10 v2.5.0 确立）。
+TIME_MATCH_TIERS = (1.0, 2.0, 3.0)
+
+# 助手消息区间匹配的右边界容差（秒）。
+# completed_at 为整秒截断（向下取整），快回复（首段保存距完成 <1s）时
+# 目标可能落进截断缝隙，右边界 +1s 保证覆盖（2026-11-11 v2.5.3 确立）。
+RANGE_END_TOLERANCE = 1.0
+
+
+def find_turn_user(messages: list, idx: int) -> int:
+    """从 idx 往前找本轮的 user 消息下标；找不到返回 -1。"""
+    for i in range(idx, -1, -1):
+        msg = messages[i]
+        role = msg[0].get("role", "") if isinstance(msg, list) and msg else (
+            msg.get("role", "") if isinstance(msg, dict) else ""
+        )
+        if role == "user":
+            return i
+    return -1
+
+
+def find_turn_end(messages: list, start: int) -> int:
+    """从 start（user 消息）往后找到下一条 user 消息为止，返回开区间右界。
+
+    一轮 = user + 该 user 之后的全部 assistant/system（工具调用链）消息。
+    """
+    for j in range(start + 1, len(messages)):
+        msg = messages[j]
+        role = msg[0].get("role", "") if isinstance(msg, list) and msg else (
+            msg.get("role", "") if isinstance(msg, dict) else ""
+        )
+        if role == "user":
+            return j
+    return len(messages)
 
 
 class _StateProxy:
@@ -97,38 +133,14 @@ class SessionOperator:
         logger.debug("获取到 %d 条消息（格式: %s）", len(messages), fmt)
         return messages
 
-    async def find_message_by_created_at(
-        self,
-        session_id: str,
-        user_id: str,
-        channel: str,
-        created_at: str,
-    ) -> tuple[int, Any]:
-        """按 created_at 时间戳查找消息。
+    def _parse_timestamp(self, text: str):
+        """解析前端传来的时间戳：ISO 字符串（可带时区）或 Unix 秒数。
 
-        支持两种格式的时间戳：
-        - ISO 字符串：如 "2026-07-12T17:46:53+00:00"
-        - Unix 秒数：如 "1783851825"（数字字符串）
-
-        会话文件中的 created_at 是 datetime 对象，匹配时做模糊比较（同秒）。
-
-        Args:
-            session_id: 会话 ID
-            user_id: 用户 ID
-            channel: 通道名称
-            created_at: 前端传来的 created_at 值（字符串形式）
-
-        Returns:
-            tuple[int, Any]: (文件索引, 消息对象)，未找到则返回 (-1, None)
+        无时区输入按 UTC 解释（前端约定传 UTC 或 Unix 秒）；无法解析返回 None。
         """
-        messages = await self.get_messages(session_id, user_id, channel)
-        if not messages:
-            return -1, None
-
-        # 解析目标时间
-        target_dt = None
-        created_at = created_at.strip()
-
+        text = (text or "").strip()
+        if not text:
+            return None
         # 尝试 ISO 格式
         for fmt in [
             "%Y-%m-%dT%H:%M:%S%z",     # 2026-07-12T17:46:53+00:00
@@ -139,20 +151,110 @@ class SessionOperator:
             "%Y-%m-%d %H:%M:%S",       # 空格无时区
         ]:
             try:
-                target_dt = datetime.strptime(created_at, fmt)
-                break
+                return datetime.strptime(text, fmt)
             except ValueError:
                 continue
+        # 尝试 Unix 秒数（合理范围防毫秒串误判：1e8≈1973 年，4e9≈2109 年）
+        try:
+            ts = float(text)
+            if 1e8 < ts < 4e9:
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OverflowError):
+            pass
+        return None
 
-        # 尝试 Unix 秒数
-        if target_dt is None:
-            try:
-                ts = float(created_at)
-                if ts > 1e8:  # 合理时间戳范围
-                    target_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            except (ValueError, OverflowError):
-                pass
+    def _find_assistant_by_range(
+        self,
+        msg_entries: list,
+        start_ts: float,
+        completed_at: str,
+    ) -> tuple:
+        """助手消息区间匹配（v2.5.3）：created_at ~ completed_at 自适应区间。
 
+        数学依据：助手消息顶层 created_at（首段保存时刻）必然落在
+        [发送, 完成] 区间内，区间随生成时长自适应，不受固定窗口限制。
+        右边界 +RANGE_END_TOLERANCE 容差：completed_at 为整秒截断，快回复
+        （首段保存距完成 <1s）时目标可能落进截断缝隙；左边界不放宽：
+        created_at 同为向下截断（≤ 真实发送时刻），放宽反而可能框进上一轮
+        助手消息造成歧义。
+        """
+        completed_text = (completed_at or "").strip()
+        if not completed_text:
+            raise ValueError(
+                "assistant 消息定位缺少 completed_at 参数。正常情况下前端"
+                "按钮上下文始终携带该字段，若缺失说明 QwenPaw 官方可能修改"
+                "了消息数据结构，请开发者检查并更新插件。"
+            )
+        completed_dt = self._parse_timestamp(completed_text)
+        if completed_dt is None:
+            raise ValueError(
+                f"无法解析 completed_at: {completed_text}（请开发者检查"
+                "QwenPaw 官方消息数据结构是否变更）"
+            )
+        if completed_dt.tzinfo is None:
+            completed_dt = completed_dt.replace(tzinfo=timezone.utc)
+        end_ts = completed_dt.timestamp() + RANGE_END_TOLERANCE
+
+        matches = [
+            (i, m) for i, m, ts in msg_entries
+            if start_ts <= ts <= end_ts and self._get_role(m) == "assistant"
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(
+                f"定位消息失败，区间 [created_at, completed_at+{RANGE_END_TOLERANCE:g}s] "
+                f"内找到 {len(matches)} 条 assistant 消息，存在歧义，请刷新网页后重试"
+            )
+        return -1, None
+
+    async def find_message_by_created_at(
+        self,
+        session_id: str,
+        user_id: str,
+        channel: str,
+        created_at: str,
+        role: str = "",
+        completed_at: str = "",
+    ) -> tuple:
+        """按 created_at 定位消息。不同角色用不同策略（v2.5.3）。
+
+        - role="assistant"：区间匹配——msg.created_at ∈
+          [created_at, completed_at + 容差] 且 role=assistant。
+          completed_at 必填，缺失抛 ValueError 提示开发者（正常情况下前端
+          按钮上下文始终携带该字段）。刷新后场景有 original_id，走精确
+          匹配，不进入本方法。
+        - 其他（user / 未指定 role）：渐进窗口 ±1s → ±2s → ±3s
+          （TIME_MATCH_TIERS），每层先按 role 过滤再判定：0 条候选 → 扩窗；
+          1 条 → 命中；≥2 条 → 抛 ValueError（真歧义）。
+
+        支持两种格式的时间戳：ISO 字符串（如 "2026-07-12T17:46:53+00:00"）
+        与 Unix 秒数（如 "1783851825"）。
+        注意：无时区的 created_at 输入按 UTC 解释（前端约定传 UTC 或 Unix 秒）；
+        会话文件内无时区时间按本地 Asia/Shanghai（UTC+8）解释。
+
+        Args:
+            session_id: 会话 ID
+            user_id: 用户 ID
+            channel: 通道名称
+            created_at: 前端传来的 created_at 值（字符串形式）
+            role: 角色过滤（"user"/"assistant"），可选
+            completed_at: assistant 区间匹配的终点（前端 completed_at 字段），
+                仅 role="assistant" 时使用，必填
+
+        Returns:
+            tuple: (文件索引, 消息对象)，未找到则返回 (-1, None)
+
+        Raises:
+            ValueError: assistant 缺少/无法解析 completed_at；或窗口/区间内
+                存在多条同角色候选（歧义）
+        """
+        messages = await self.get_messages(session_id, user_id, channel)
+        if not messages:
+            return -1, None
+
+        # 解析目标时间
+        target_dt = self._parse_timestamp(created_at)
         if target_dt is None:
             logger.warning("无法解析 created_at: %s", created_at)
             return -1, None
@@ -167,10 +269,9 @@ class SessionOperator:
         import datetime as _dt_mod
         LOCAL_TZ = _dt_mod.timezone(_dt_mod.timedelta(hours=8), "Asia/Shanghai")
 
-        # 先统一计算所有消息的 Unix 秒数
+        # 统一计算所有消息的 Unix 秒数
         msg_entries = []  # (index, msg, msg_ts)
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
+        for i, msg in enumerate(messages):
             # 提取 msg dict
             if isinstance(msg, list) and len(msg) > 0:
                 d = msg[0]
@@ -201,23 +302,25 @@ class SessionOperator:
 
             msg_entries.append((i, msg, msg_ts))
 
-        # 第一轮：严格匹配（同一秒）
-        strict = [(i, m) for i, m, ts in msg_entries if int(ts) == int(target_ts)]
-        if len(strict) == 1:
-            return strict[0]
-        if len(strict) > 1:
-            raise ValueError(
-                "定位消息失败，基于 created_at 寻找匹配消息，发现多个同一时间的匹配"
-            )
+        # ── assistant：区间匹配（v2.5.3）──
+        if role == "assistant":
+            return self._find_assistant_by_range(msg_entries, target_ts, completed_at)
 
-        # 第二轮：宽松匹配（±1 秒容差）
-        fuzzy = [(i, m) for i, m, ts in msg_entries if abs(ts - target_ts) <= 1]
-        if len(fuzzy) == 1:
-            return fuzzy[0]
-        if len(fuzzy) > 1:
-            raise ValueError(
-                "定位消息失败，基于 created_at 寻找匹配消息，发现多个相近时间的匹配"
-            )
+        # ── user / 未指定 role：渐进窗口匹配 ±1s → ±2s → ±3s，每层先筛 role ──
+        for window in TIME_MATCH_TIERS:
+            tier = [
+                (i, m) for i, m, ts in msg_entries
+                if abs(ts - target_ts) <= window
+                and (not role or self._get_role(m) == role)
+            ]
+            if len(tier) == 1:
+                return tier[0]
+            if len(tier) > 1:
+                raise ValueError(
+                    f"定位消息失败，基于 created_at（±{window:g}s 窗口）找到 "
+                    f"{len(tier)} 条同角色匹配消息，存在歧义，请刷新网页后重试"
+                )
+            # 该层 0 条候选 → 继续下一层窗口
 
         return -1, None
 
@@ -699,17 +802,16 @@ class SessionOperator:
         user_id: str,
         channel: str,
         messages: List[Any],
+        expect_count: int | None = None,
     ):
         """更新会话文件中的消息列表。
 
         通过 SafeJSONSession.update_session_state() API 写入，
         自动检测格式，原子写入 + 写入锁保护。
 
-        Args:
-            session_id: 会话 ID
-            user_id: 用户 ID
-            channel: 通道名称
-            messages: 新的消息列表
+        expect_count 不为 None 时做乐观并发校验：写入前重新读一次磁盘，
+        若消息总数 != expect_count，说明「读取 → 写回」期间 agent 追加了
+        消息，放弃写入抛 SessionChangedError，避免静默覆盖导致丢消息。
         """
         state = await self.session.get_session_state_dict(
             session_id,
@@ -718,6 +820,17 @@ class SessionOperator:
             allow_not_exist=False,
         )
         fmt = self._detect_format(state)
+        if expect_count is not None:
+            current = (
+                state.get("agent", {}).get("memory", {}).get("content", [])
+                if fmt == "old"
+                else state.get("agent", {}).get("state", {}).get("context", [])
+            )
+            if len(current) != expect_count:
+                raise SessionChangedError(
+                    f"会话在操作期间被修改（{expect_count} → {len(current)} 条），"
+                    "为避免覆盖新消息已中止写入，请重试"
+                )
         key = self._get_msg_key(fmt)
         await self.session.update_session_state(
             session_id,
@@ -726,3 +839,7 @@ class SessionOperator:
             user_id=user_id,
             channel=channel,
         )
+
+
+class SessionChangedError(RuntimeError):
+    """会话在「读取 → 写回」之间被追加/修改（并发写入），写入已中止。"""

@@ -2,6 +2,87 @@
 
 本文件记录 qwenpaw-plugin-session-tools 的所有重要变更。
 
+## [2.5.5] - 2026-11-11
+
+### Fixed
+- 🐛 **http_get_message 补 `except ValueError → 409`**（对抗复审 P2-1 半属实）：v2.5.3 在
+  assistant 分支新增的 ValueError 路径（缺 completed_at / 不可解析 / 区间歧义）在该端点
+  会落进 `except Exception` → 500。对齐其余四端点的 409 语义。复审同时误报 http_regen
+  缺该分支——实测 497-498 行已有，驳回。
+
+### Added
+- 🧪 测试从 49 扩至 52 用例（复审 P3-3 覆盖洞）：role="" 显式路径、completed_at 传 naive
+  无时区 ISO（锁定按 UTC 解释）、区间倒挂病态输入。
+- 📝 CHANGELOG 补 [2.5.2] 已回退说明（复审 P3-2）；README 安装示例版本同步（P3-1）。
+
+
+## [2.5.4] - 2026-11-11
+
+### Fixed
+- 🚧 **流式中刷新页面的气泡定位死区**：提交提示词后 agent 流式输出中刷新网页，user 气泡
+  可能既无 `original_id` 且 `created_at=0`（消息尚未持久化）——任何定位方式都无效。
+  前端五按钮在 `created_at` 为 0 时直接提示"找不到消息：agent 正在流式输出，请等回复完成
+  后刷新网页再试"，不发后端请求。
+
+
+## [2.5.2] - 2026-11-10（已回退，未发布）
+
+> 曾实现「同轮定位」方案（role=assistant 先定位轮次 user 消息再取该轮最后一条 assistant），
+> 打包安装后经作者确认时差数据（漂移实测 8.8s 远超预期、created_at 双形态同指发送时刻），
+> 判定方向不佳，整体回退至 v2.5.1，由 v2.5.3 区间定位方案取代。
+
+
+## [2.5.3] - 2026-11-11
+
+### Changed
+- 🎯 **assistant 端改用区间定位（不同角色不同方法）**：user 端维持渐进窗口 ±1/2/3s 不变；
+  assistant 端改用 `created_at ~ completed_at` 自适应区间——助手消息顶层 `created_at`
+  （首段保存时刻）必然落在 [发送, 完成] 区间内，区间随生成时长自适应，
+  彻底解决固定窗口对长漂移（实测 8.8s）失效的问题。
+- 🚫 **completed_at 缺失显式报错**：assistant 定位缺少/无法解析 `completed_at` 直接抛错
+  提示开发者检查官方结构（正常情况下前端按钮上下文始终携带该字段），不做静默降级。
+
+### Added
+- 📐 **右边界 +1s 容差**（`RANGE_END_TOLERANCE`）：`completed_at` 为整秒截断，
+  快回复（首段保存距完成 <1s）时目标可能落进截断缝隙；左边界不放宽（同为向下截断，
+  放宽可能框进上一轮助手消息）。
+- 🌐 **五端点 + `_locate_message` 透传 `completed_at`**（rewind / regen / fork / delete / inspect）；
+  前端五个按钮在 assistant 气泡且无 original_id（刷新前）时校验并携带 `ctx.data.completed_at`。
+- 🧪 测试从 38 扩至 49 用例：区间命中（实测漂移 8.8s 复现）、Unix 秒起点、截断缝隙容差、
+  role 排除、上一轮不误命中、歧义 409、缺失/空白/不可解析报错、user 端回归。
+
+
+## [2.5.1] - 2026-11-10
+
+### Changed
+- ⏹️ **fork 也先停流（方案 B 补全）**：`http_fork` 入口新增 `_stop_session_stream()`。实测发现：agent 流式回复中点 fork，原会话 run 继续跑——分叉快照内容不确定（读取瞬间与定位消息可能错位），且刷新页面后 SSE 断开而后台 run 仍在跑，状态混乱。fork 的语义是「从该消息定格分叉」，与破坏性操作同样需要先停源会话
+
+## [2.5.0] - 2026-11-10
+
+### Added
+- 🛡️ **expect_count 乐观并发校验**：`_update_content` 写入前重读磁盘，消息总数与读取时不符即抛 `SessionChangedError` 中止写入（HTTP 409），杜绝「agent 追加消息被静默覆盖导致整个上下文丢失」（自 qwenpaw-session-tools-pro 反向吸收）
+- ⏹️ **主动停止流式输出（方案 B）**：WebUI 按钮触发的破坏性 HTTP 操作（rewind / regen / delete）入口处先调 `_stop_session_stream()`——经 `chat_manager.get_chat_id_by_session` 反查 chat_id，`task_tracker.request_stop` 取消运行中的 run（幂等，未运行返回 False）；**await 带 15 秒超时**防长任务取消挂起阻塞请求；反查失败/超时不阻塞操作，仍有 expect_count 校验兜底。**slash 命令不做 stop**（执行时正处于 agent run 内，stop 等于自杀）
+- 🎯 **created_at 渐进窗口匹配 + role 筛选**：`find_message_by_created_at` 新增可选 `role` 参数，匹配窗口逐层放宽 ±1s → ±2s → ±3s（模块常量 `TIME_MATCH_TIERS`），每层先按 role 过滤再判定：0 条扩窗 / 1 条命中 / ≥2 条 409。前端新增 `getBubbleRole(ctx)` 判断气泡角色并随请求传递，解决「刚发消息就点 rewind 定位不到」（气泡时间戳与写盘时间漂移 1~3 秒）
+- 🧹 **前端 purgeMessageCache**：破坏性操作刷新前清两类宿主本地残留——`localStorage/sessionStorage` 的 `qwenpaw_pending_user_msg_{chatId}`（宿主持久化的发送中消息，reload 后复活成气泡，即「回退后消息删不掉」的根因）+ React 内存消息 store（root fiber 遍历找 `clearSessionMessages`）。全部 best-effort；fork / regen 刷新不 purge（regen 后续还有模拟发送）
+
+### Changed
+- 🔄 **点气泡删除 = 删整轮**：`http_delete_message` 改用 `find_turn_user` / `find_turn_end`（移入 session_ops.py 便于测试）轮次感知删除（user + assistant + system 工具链，直到下一条 user），替代原版只删「相邻一对」；定位消息之前无 user 消息时退化为只删自身
+- 📂 **fork 统一走 ChatManager**：`http_fork` 移除手写 `chats.json` 分支，改为 `cm.create_chat(ChatSpec(...))`，不再与运行中的 ChatManager 状态互相覆盖；源会话名改经 `cm.list_chats` 查询
+- 🎯 `_locate_message` 与全部 HTTP 端点（rewind / regen / fork / delete / get_message）新增 `role` Query 参数，透传给 created_at 匹配
+- 🧪 测试从 16 扩至 38 用例：渐进窗口三层、窗口闭区间边界（Δ=2.0/3.0）、role 筛选（含旧格式）、Unix 毫秒串防护、`find_turn_user`/`find_turn_end` 轮次辅助函数全集
+
+### Fixed
+- 🐛 **三端点 400/404 被吞成 500**（存量 bug，v2.4.0 起就有）：`http_rewind` / `http_fork` / `http_delete_message` 缺 `except HTTPException: raise`，`_locate_message` 抛出的 400/404 被 `except Exception` 降级为 500 且 detail 丢失——三处统一补齐（http_regen / http_get_message 原本就有）
+- 🐛 Unix 时间戳解析加合理范围 `1e8 < ts < 4e9`，毫秒串误传不再产生荒谬匹配
+- 🧹 清理：`session_ops.py` 死 `import json`；`_update_content` 冗余 `_detect_format` 调用；`msg_entries` 倒序遍历（无行为影响的旧残留）改正序
+
+### Security
+- 🔒 并发校验覆盖全部 HTTP 破坏性写回路径（rewind / regen / delete），写入原子性由宿主 SafeJSONSession 写入锁保证
+- 🔒 stop 超时保护：`asyncio.wait_for(timeout=15)` 防 uncancelable 区域挂起阻塞 HTTP 请求
+
+### 复审
+- 🔍 3 个无上下文子 agent 并行对抗复审（后端并发安全 / 定位与轮次删除 / 前端），报 2 P1 + 12 P2；采纳修复见上（stop 超时、HTTPException 透传、测试补齐等），驳回 1 条误报（ChatSpec.created_at 实测有 default_factory 非必填），其余 P2 为存量既有行为（callApi 不查 HTTP 状态码等）保持不动
+
 ## [2.4.0] - 2026-08-14
 
 ### Added

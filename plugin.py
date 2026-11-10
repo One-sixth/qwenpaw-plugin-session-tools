@@ -1,14 +1,32 @@
-"""会话增强工具插件 — 提供 /fork、/rewind、/regen 命令 + HTTP API
+"""会话增强工具插件 — 提供 /fork、/rewind、/regen、/noreply 命令 + HTTP API
 
 QwenPaw 2.x 版本。
 
 架构说明：
 - 所有命令（/rewind, /fork, /regen）用 register_slash_command() 注册
 - /regen 修改 ctx.input_msgs 后返回 None 让 agent 继续
-- HTTP API 优先使用 original_id（UUID）精确匹配，不可用时回退到 created_at 模糊匹配
+- HTTP API 优先使用 original_id（UUID）精确匹配，不可用时回退到 created_at 按角色定位
+  （assistant 区间匹配 / 其他渐进窗口，v2.5.3）：
+  user 端维持渐进窗口；assistant 端用 created_at ~ completed_at 自适应区间
+  （首段保存时刻必然落在 [发送, 完成] 区间内，随生成时长自适应）；
+  completed_at 缺失或为空直接报错提示开发者（正常情况下前端按钮上下文
+  始终携带该字段）
 - 通过 SafeJSONSession API 读写会话文件
+
+v2.5.0 增强（自 qwenpaw-session-tools-pro 反向吸收 + 自研）：
+- expect_count 乐观并发校验：写入前重读磁盘，消息数变化即中止（SessionChangedError → 409），
+  杜绝"agent 追加消息被静默覆盖导致上下文丢失"
+- 主动停止流式输出（方案 B）：WebUI 按钮触发的破坏性 HTTP 操作入口处，
+  先经 task_tracker.request_stop 停止目标会话运行中的生成（幂等，未运行返回 False；
+  带超时防长任务阻塞），从时序上保证操作期间会话不再变化；
+  slash 命令不做 stop（执行时正处于 agent run 内，自杀风险）
+- 点气泡删除 = 删整轮（user + assistant + system 工具链），不再只删相邻一对
+- created_at 定位渐进窗口 ±1s/±2s/±3s + role 筛选（每层先筛角色再判定）
+- fork 的 HTTP 路径统一走 ChatManager.create_chat（移除手写 chats.json 分支）
+- 前端破坏性操作刷新前 purgeMessageCache（清宿主 React 消息 store 与 pending_user_msg 残留）
 """
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -17,7 +35,13 @@ from agentscope.message import Msg, TextBlock
 from fastapi import APIRouter, HTTPException, Query, Request
 from qwenpaw.plugins.api import PluginApi
 
-from .session_ops import SessionOperator, sanitize_filename
+from .session_ops import (
+    SessionChangedError,
+    SessionOperator,
+    find_turn_end,
+    find_turn_user,
+    sanitize_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +52,71 @@ _operators: dict = {}
 router = APIRouter()
 
 
-async def _get_workspace_dir(request: Request) -> Path:
-    """获取当前请求对应的 agent 工作区路径（多 agent 感知）。
+async def _get_workspace(request: Request):
+    """获取当前请求对应的 agent Workspace 对象（多 agent 感知）。
 
     通过 QwenPaw 官方 get_agent_for_request 解析当前 agent：
     优先级依次为 agent_id 参数 → request.state.agent_id → X-Agent-Id header → active agent。
-    参考 qwenpaw-plugin-file-tools 的 get_workspace_dir() 实现。
     """
     from qwenpaw.app.agent_context import get_agent_for_request
-    from pathlib import Path
 
-    ws = await get_agent_for_request(request)
+    return await get_agent_for_request(request)
+
+
+async def _get_workspace_dir(request: Request) -> Path:
+    """获取当前请求对应的 agent 工作区路径（多 agent 感知）。"""
+    ws = await _get_workspace(request)
     return Path(ws.workspace_dir).expanduser().resolve()
+
+
+async def _stop_session_stream(request: Request, session_id: str, channel: str) -> bool:
+    """主动停止目标会话运行中的流式输出（方案 B：破坏性操作前无条件调用）。
+
+    复用宿主停止机制：chat_manager.get_chat_id_by_session 反查 chat_id，
+    再 task_tracker.request_stop 取消运行中的 run（task.cancel + await 真正停止）。
+    await 带 15 秒超时：run 的取消若因 uncancelable 区域长时间挂起，放弃等待
+    继续操作（cancel 信号已发出），由 expect_count 校验兜底。
+    幂等无害：会话未在运行时返回 False；任何异常均吞掉并返回 False，
+    不阻塞后续操作（stop 失败仍有 expect_count 校验兜底）。
+
+    Returns:
+        True = 有运行中的任务被停止；False = 未在运行或停止失败/超时。
+    """
+    try:
+        ws = await _get_workspace(request)
+        cm = getattr(ws, "chat_manager", None)
+        if cm is None:
+            return False
+        try:
+            chat_id = await cm.get_chat_id_by_session(
+                session_id=session_id, channel=channel or "console",
+            )
+        except Exception:
+            logger.debug("反查 chat_id 失败，跳过停止（expect_count 兜底）", exc_info=True)
+            return False
+        if not chat_id:
+            return False
+        tracker = getattr(ws, "task_tracker", None)
+        if tracker is None:
+            return False
+        try:
+            stopped = await asyncio.wait_for(
+                tracker.request_stop(chat_id, reason="user"),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "停止会话 %s 的 run 超过 15s 未完成，放弃等待继续操作（cancel 信号已发出）",
+                session_id,
+            )
+            return False
+        if stopped:
+            logger.info("已停止会话 %s 的流式输出（chat_id=%s）", session_id, chat_id)
+        return stopped
+    except Exception:
+        logger.exception("停止会话流式输出失败（忽略，继续操作）")
+        return False
+
 
 
 def _ensure_operator(workspace_dir: Path) -> SessionOperator:
@@ -72,8 +149,10 @@ async def _locate_message(
     op: SessionOperator,
     session_id: str, user_id: str, channel: str,
     original_id: str = "", created_at: str = "",
+    role: str = "", completed_at: str = "",
 ) -> tuple[int, Any]:
-    """定位消息：优先 original_id 精确匹配，回退 created_at 模糊匹配。
+    """定位消息：优先 original_id 精确匹配，回退 created_at 按角色定位
+    （assistant 区间匹配 / 其他渐进窗口，v2.5.3）。
 
     Args:
         op: SessionOperator 实例
@@ -82,12 +161,16 @@ async def _locate_message(
         channel: 通道名称
         original_id: 消息 UUID（对应 session 文件 msg.id），可选
         created_at: 时间戳，可选
+        role: 角色过滤（"user"/"assistant"），仅作用于 created_at 匹配，可选
+        completed_at: assistant 区间匹配终点（role="assistant" 时必填），
+            仅作用于 created_at 匹配，可选
 
     Returns:
         tuple[int, Any]: (文件索引, 消息对象)
 
     Raises:
-        HTTPException: 400 两个参数都为空，404 未找到
+        HTTPException: 400 参数全空，404 未找到，
+                       409 created_at 匹配到多条同角色候选
     """
     if not original_id and not created_at:
         raise HTTPException(
@@ -103,7 +186,7 @@ async def _locate_message(
     else:
         file_idx, target_msg = await op.find_message_by_created_at(
             session_id, user_id, channel,
-            created_at=created_at,
+            created_at=created_at, role=role, completed_at=completed_at,
         )
 
     if file_idx < 0:
@@ -313,32 +396,44 @@ async def _handle_regen_slash(ctx, args: str) -> Msg | None:
 async def http_rewind(request: Request, session_id: str,
                        user_id: str = Query(...), channel: str = Query(...),
                        original_id: str = Query(default=""),
-                       created_at: str = Query(default="")):
+                       created_at: str = Query(default=""),
+                       role: str = Query(default=""),
+                       completed_at: str = Query(default="")):
     """回退：按 original_id 或 created_at 定位消息后删除其及之后所有消息。
 
-    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 按角色定位（assistant 区间匹配 / 其他渐进窗口，v2.5.3）。
+    入口先停止该会话运行中的流式输出（方案 B），写回前做 expect_count 并发校验。
     """
     try:
+        # 方案 B：破坏性操作前先停止目标会话的流式输出（幂等）
+        await _stop_session_stream(request, session_id, channel)
+
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         file_idx, target_msg = await _locate_message(
             op, session_id, user_id, channel,
-            original_id=original_id, created_at=created_at,
+            original_id=original_id, created_at=created_at, role=role,
+            completed_at=completed_at,
         )
 
         rewound_message = _get_user_text(target_msg)
         messages = await op.get_messages(session_id, user_id, channel)
         new_messages = messages[:file_idx]
         deleted = len(messages) - len(new_messages)
-        await op._update_content(session_id, user_id, channel, new_messages)
+        await op._update_content(session_id, user_id, channel, new_messages,
+                                 expect_count=len(messages))
 
         return {"success": True, "deleted": deleted, "remaining": len(new_messages),
                 "rewound_message": rewound_message}
+    except SessionChangedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("回退失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -348,21 +443,28 @@ async def http_rewind(request: Request, session_id: str,
 async def http_regen(request: Request, session_id: str,
                       user_id: str = Query(...), channel: str = Query(...),
                       original_id: str = Query(default=""),
-                      created_at: str = Query(default="")):
+                      created_at: str = Query(default=""),
+                      role: str = Query(default=""),
+                      completed_at: str = Query(default="")):
     """重新生成：按 original_id 或 created_at 定位到助手消息，找到对应的用户消息，
     回退到用户消息位置（删除该用户消息及之后所有），返回用户消息文本。
 
-    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 按角色定位（assistant 区间匹配 / 其他渐进窗口，v2.5.3）。
+    入口先停止该会话运行中的流式输出（方案 B），写回前做 expect_count 并发校验。
     前端将返回的文本填入输入框并发送，触发 agent 重新生成回复。
     """
     try:
+        # 方案 B：破坏性操作前先停止目标会话的流式输出（幂等）
+        await _stop_session_stream(request, session_id, channel)
+
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         # 1. 定位到助手消息
         file_idx, target_msg = await _locate_message(
             op, session_id, user_id, channel,
-            original_id=original_id, created_at=created_at,
+            original_id=original_id, created_at=created_at, role=role,
+            completed_at=completed_at,
         )
 
         messages = await op.get_messages(session_id, user_id, channel)
@@ -373,8 +475,8 @@ async def http_regen(request: Request, session_id: str,
         for i in range(file_idx, -1, -1):
             msg = messages[i]
             d = msg[0] if isinstance(msg, list) else msg
-            role = d.get("role", "")
-            if role == "user":
+            role_ = d.get("role", "")
+            if role_ == "user":
                 user_idx = i
                 user_text = _get_user_text(d)
                 break
@@ -385,10 +487,13 @@ async def http_regen(request: Request, session_id: str,
         # 3. rewind 到用户消息位置（删除该用户消息及之后所有）
         new_messages = messages[:user_idx]
         deleted = len(messages) - len(new_messages)
-        await op._update_content(session_id, user_id, channel, new_messages)
+        await op._update_content(session_id, user_id, channel, new_messages,
+                                 expect_count=len(messages))
 
         return {"success": True, "deleted": deleted, "remaining": len(new_messages),
                 "rewound_message": user_text}
+    except SessionChangedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
@@ -404,67 +509,62 @@ async def http_regen(request: Request, session_id: str,
 async def http_fork(request: Request, session_id: str,
                      user_id: str = Query(...), channel: str = Query(...),
                      original_id: str = Query(default=""),
-                     created_at: str = Query(default="")):
+                     created_at: str = Query(default=""),
+                     role: str = Query(default=""),
+                     completed_at: str = Query(default="")):
     """分叉：按 original_id 或 created_at 定位消息后分叉新会话。
 
-    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
+    优先使用 original_id 精确匹配，不可用时回退到 created_at 按角色定位（assistant 区间匹配 / 其他渐进窗口，v2.5.3）。
+    新会话统一经 ChatManager.create_chat 注册（v2.5.0，移除手写 chats.json 分支，
+    避免与运行中的 ChatManager 状态互相覆盖）。
+    入口先停止源会话运行中的流式输出（v2.5.1，方案 B）：fork 的语义是
+    「从该消息定格分叉」，agent 继续跑会让分叉快照内容不确定，且刷新后
+    SSE 断开而后台 run 仍在跑，状态混乱——fork 与破坏性操作同样需要先停。
     """
     try:
-        ws_dir = await _get_workspace_dir(request)
+        # 方案 B：先停止源会话的流式输出（幂等），保证分叉快照确定
+        await _stop_session_stream(request, session_id, channel)
+
+        ws = await _get_workspace(request)
+        ws_dir = Path(ws.workspace_dir).expanduser().resolve()
         op = _ensure_operator(ws_dir)
 
         file_idx, target_msg = await _locate_message(
             op, session_id, user_id, channel,
-            original_id=original_id, created_at=created_at,
+            original_id=original_id, created_at=created_at, role=role,
+            completed_at=completed_at,
         )
 
         messages = await op.get_messages(session_id, user_id, channel)
         truncated = messages[:file_idx + 1]
 
-        from datetime import datetime
         new_id = await op.fork(session_id, user_id, channel, 0, messages=truncated)
 
-        # 注册到 chat_manager — 直接操作 chats.json 文件
-        try:
-            import json
-            from datetime import datetime, timezone
-            import uuid
-
-            chats_path = ws_dir / "chats.json"
-            if chats_path.exists():
-                with open(chats_path, "r", encoding="utf-8") as f:
-                    chats_data = json.load(f)
-
-                # 获取源会话名称
-                src_name = session_id
-                for c in chats_data.get("chats", []):
-                    if c.get("session_id") == session_id:
-                        src_name = c.get("name", session_id)
+        # 注册到会话列表 — 统一走 ChatManager（v2.5.0）
+        src_name = ""
+        session_name = f"Fork: {session_id}"
+        cm = getattr(ws, "chat_manager", None)
+        if cm is not None:
+            try:
+                for c in await cm.list_chats(user_id=user_id, channel=channel):
+                    if c.session_id == session_id:
+                        src_name = c.name or ""
                         break
+            except Exception:
+                logger.warning("fork: 查询源会话名称失败", exc_info=True)
+            try:
+                from qwenpaw.app.chats.models import ChatSpec
+                await cm.create_chat(ChatSpec(
+                    name=f"Fork: {src_name or session_id}",
+                    session_id=new_id, user_id=user_id, channel=channel,
+                    meta={"forked_from": session_id},
+                ))
+            except Exception as e:
+                logger.warning("chat_manager 注册失败（非致命）: %s", e)
+        else:
+            logger.warning("fork: workspace 无 chat_manager，新会话未注册到列表")
 
-                new_chat = {
-                    "channel": channel,
-                    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                    "id": str(uuid.uuid4()),
-                    "meta": {"forked_from": session_id},
-                    "name": f"Fork: {src_name}",
-                    "pinned": False,
-                    "session_id": new_id,
-                    "source": "chat",
-                    "status": "idle",
-                    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                    "user_id": user_id,
-                }
-
-                chats_data.setdefault("chats", []).append(new_chat)
-                with open(chats_path, "w", encoding="utf-8") as f:
-                    json.dump(chats_data, f, ensure_ascii=False, indent=2)
-
-                logger.info("已通过 chats.json 注册 fork 新会话: %s", new_id)
-        except Exception as e:
-            logger.warning("chats.json 注册失败（非致命）: %s", e)
-
-        session_name = f"Fork: {src_name}"
+        session_name = f"Fork: {src_name or session_id}"
         session_path = str(ws_dir / "sessions" / channel / sanitize_filename(f"{user_id}_{new_id}.json"))
 
         return {"success": True, "new_session_id": new_id, "messages": len(truncated),
@@ -473,6 +573,8 @@ async def http_fork(request: Request, session_id: str,
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("分叉失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -482,63 +584,53 @@ async def http_fork(request: Request, session_id: str,
 async def http_delete_message(request: Request, session_id: str,
                                user_id: str = Query(...), channel: str = Query(...),
                                original_id: str = Query(default=""),
-                               created_at: str = Query(default="")):
-    """删除消息：按 original_id 或 created_at 定位消息后删除整轮。
+                               created_at: str = Query(default=""),
+                               role: str = Query(default=""),
+                               completed_at: str = Query(default="")):
+    """删除消息：轮次感知地删除整个回合（v2.5.0）。
 
-    优先使用 original_id 精确匹配，不可用时回退到 created_at 模糊匹配。
+    一轮 = 本轮 user 消息 + 其后全部 assistant/system（含工具调用链），
+    直到下一条 user 消息为止。替代原版只删"相邻一对"的逻辑。
+    入口先停止该会话运行中的流式输出（方案 B），写回前做 expect_count 并发校验。
     """
     try:
+        # 方案 B：破坏性操作前先停止目标会话的流式输出（幂等）
+        await _stop_session_stream(request, session_id, channel)
+
         ws_dir = await _get_workspace_dir(request)
         op = _ensure_operator(ws_dir)
 
         file_idx, target_msg = await _locate_message(
             op, session_id, user_id, channel,
-            original_id=original_id, created_at=created_at,
+            original_id=original_id, created_at=created_at, role=role,
+            completed_at=completed_at,
         )
 
         messages = await op.get_messages(session_id, user_id, channel)
 
-        # 删除整轮：找到匹配消息所在的轮次（用户消息+助手回复）
-        # 从当前消息往前找最近的 user 消息，往后找最近的 assistant 消息
-        target_role = ""
-        if isinstance(target_msg, list) and len(target_msg) > 0:
-            target_role = target_msg[0].get("role", "")
-        elif isinstance(target_msg, dict):
-            target_role = target_msg.get("role", "")
-
-        if target_role == "user":
-            # 点击的是用户消息：删该用户消息 + 紧跟其后的助手消息（如果存在）
+        # 删整轮：从被点消息往前找本轮 user 起点，往后扫到下一条 user 为止
+        start_idx = find_turn_user(messages, file_idx)
+        if start_idx < 0:
+            # 定位消息之前没有 user 消息（异常历史），退化为只删该消息自身
             start_idx = file_idx
-            # 检查下一条是否是助手消息
-            if file_idx + 1 < len(messages):
-                next_msg = messages[file_idx + 1]
-                next_role = ""
-                if isinstance(next_msg, list) and len(next_msg) > 0:
-                    next_role = next_msg[0].get("role", "")
-                elif isinstance(next_msg, dict):
-                    next_role = next_msg.get("role", "")
-                if next_role == "assistant":
-                    end_idx = file_idx + 2  # 用户+助手
-                else:
-                    end_idx = file_idx + 1  # 只删用户
-            else:
-                end_idx = file_idx + 1  # 没有下一条，只删用户
-        else:
-            # 点击的是助手消息：删该助手消息 + 前面的用户消息
-            start_idx = file_idx - 1  # 前面的用户消息
-            if start_idx < 0:
-                start_idx = 0
             end_idx = file_idx + 1
+        else:
+            end_idx = find_turn_end(messages, start_idx)
 
         new_messages = messages[:start_idx] + messages[end_idx:]
         deleted = end_idx - start_idx
 
-        await op._update_content(session_id, user_id, channel, new_messages)
+        await op._update_content(session_id, user_id, channel, new_messages,
+                                 expect_count=len(messages))
         return {"success": True, "deleted": deleted, "remaining": len(new_messages)}
+    except SessionChangedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("删除失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -548,11 +640,13 @@ async def http_delete_message(request: Request, session_id: str,
 async def http_get_message(request: Request, session_id: str,
                             user_id: str = Query(...), channel: str = Query(...),
                             original_id: str = Query(default=""),
-                            created_at: str = Query(default="")):
+                            created_at: str = Query(default=""),
+                            role: str = Query(default=""),
+                            completed_at: str = Query(default="")):
     """获取消息详情：按 original_id 或 created_at 查找消息，返回完整 JSON。
 
     至少提供 original_id 或 created_at 中的一个参数。
-    优先使用 original_id，其次 created_at。
+    优先使用 original_id，回退到 created_at 按角色定位（assistant 区间匹配 / 其他渐进窗口，v2.5.3）。
     """
     if not original_id and not created_at:
         raise HTTPException(
@@ -572,7 +666,8 @@ async def http_get_message(request: Request, session_id: str,
         else:
             file_idx, target_msg = await op.find_message_by_created_at(
                 session_id, user_id, channel,
-                created_at=created_at,
+                created_at=created_at, role=role,
+                completed_at=completed_at,
             )
 
         if file_idx < 0 or target_msg is None:
@@ -588,6 +683,9 @@ async def http_get_message(request: Request, session_id: str,
             msg_dict = target_msg
 
         return {"success": True, "index": file_idx, "message": msg_dict}
+    except ValueError as e:
+        # assistant 区间定位的 ValueError（缺 completed_at / 不可解析 / 区间歧义）→ 409
+        raise HTTPException(status_code=409, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="定位消息失败，会话文件未找到")
     except HTTPException:

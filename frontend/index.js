@@ -1,13 +1,20 @@
 /**
  * QwenPaw 会话增强工具 — 前端 UI（QwenPaw 2.x 版本）
  *
- * ★ 消息定位策略（2026-08-14 增强）：
- *   优先使用 original_id（精确 UUID 匹配），不可用时回退到 created_at（秒级模糊匹配）
+ * ★ 消息定位策略（2026-08-14 增强 / 2026-11-10 v2.5.0 / 2026-11-11 v2.5.3 更新）：
+ *   优先使用 original_id（精确 UUID 匹配），不可用时回退到 created_at
+ *   按角色定位（role 由 getBubbleRole 从 ctx.data 判断）：
+ *   - assistant：区间匹配（created_at ~ completed_at 自适应区间，v2.5.3）；
+ *     completed_at 缺失或为空直接报错提示开发者（正常情况下必存在）
+ *   - user：渐进窗口匹配（±1s → ±2s → ±3s，每层先按气泡 role 过滤再判定）
  *
  * 数据来源：
  *   - 用户气泡：ctx.data.input[0].metadata.original_id → session 文件 msg.id
  *   - 助手气泡：ctx.data.output[0].metadata.original_id → session 文件 msg.id
  *   - 兜底：ctx.data.created_at → find_message_by_created_at()
+ *     （assistant 额外携带 ctx.data.completed_at 做区间终点）
+ *   - 死区拦截（v2.5.4）：created_at 为 0（流式中刷新、消息未持久化）→
+ *     直接提示等待刷新，不发后端请求
  *
  * 历史方案（已废弃，注释保留供参考）：
  *   - message_id 注入方案：改 envelope.py / utils.py 注入 msg.id → 前端拿不到（已移除）
@@ -105,6 +112,90 @@
   }
 
   /**
+   * 从 ctx.data 判断气泡角色（v2.5.0）
+   *
+   * 用户气泡含 input[0]，助手气泡含 output[0]。
+   * 该 role 传给后端做 created_at 渐进窗口匹配的角色过滤——
+   * 同一轮的 user/assistant 消息时间可能只差 1~3 秒，不筛角色会撞车 409。
+   *
+   * @param {Object} ctx - onClick 的上下文对象
+   * @returns {string} "user" / "assistant"，判断不了返回 ""
+   */
+  function getBubbleRole(ctx) {
+    if (!ctx || !ctx.data) return "";
+    if (ctx.data.input && ctx.data.input.length > 0 && ctx.data.input[0]) return "user";
+    if (ctx.data.output && ctx.data.output.length > 0 && ctx.data.output[0]) return "assistant";
+    return "";
+  }
+
+  /**
+   * 清掉宿主破坏性操作后的一切本地残留，防止旧气泡"活过"刷新（v2.5.0）
+   *
+   * 两个来源：
+   * 1. localStorage 的 qwenpaw_pending_user_msg_{chatId}——宿主把发送中的
+   *    用户消息持久化在这里，reload 后会恢复成气泡（"回退后消息删不掉、
+   *    硬刷新也复活"的真正根因）；按 sessionId + URL chatId 双 key、
+   *    localStorage + sessionStorage 双存储清除
+   * 2. React 内存消息 store——从 root fiber 遍历找到挂载
+   *    clearSessionMessages/setMessages 的 Context value，清当前会话缓存，
+   *    让点击后到 reload 前的窗口期旧气泡立即消失（即时反馈）
+   *
+   * 依赖宿主内部实现，全部 best-effort：失败静默退化，不影响后续刷新。
+   */
+  function purgeMessageCache(sessionId) {
+    try {
+      // ① 清 pending 用户消息（双存储 + 双 key + 兜底收集）
+      var sids = [];
+      if (sessionId) sids.push(sessionId);
+      try {
+        var m = window.location.pathname.match(/\/chat\/([^/?#]+)/);
+        if (m && m[1] && sids.indexOf(m[1]) < 0) sids.push(m[1]);
+      } catch (_) {}
+      var stores = [window.localStorage, window.sessionStorage];
+      for (var si = 0; si < sids.length; si++) {
+        for (var st = 0; st < stores.length; st++) {
+          try { stores[st].removeItem("qwenpaw_pending_user_msg_" + sids[si]); } catch (_) {}
+        }
+      }
+
+      // ② 清 React 内存消息 store（fiber 树遍历，步数上限防大页面卡顿）
+      var rootEl = document.getElementById("root") || document.body.firstElementChild;
+      if (!rootEl) return;
+      var fiberKey = Object.keys(rootEl).find(function (k) {
+        return k.indexOf("__reactContainer") === 0 || k.indexOf("__reactFiber") === 0;
+      });
+      if (!fiberKey) return;
+
+      var purged = false;
+      var seen = 0;
+      (function walk(fiber) {
+        if (!fiber || seen++ > 4000 || purged) return;
+        var props = fiber.memoizedProps;
+        if (props && typeof props === "object") {
+          var v = props.value;
+          if (v && typeof v.clearSessionMessages === "function" &&
+              typeof v.setMessages === "function") {
+            try {
+              v.clearSessionMessages(sessionId || "");
+              v.clearSessionMessages(undefined);
+              v.setMessages([]);
+              purged = true;
+            } catch (_) {}
+            return;
+          }
+        }
+        walk(fiber.child);
+        var sibling = fiber.sibling;
+        while (sibling && !purged) { walk(sibling); sibling = sibling.sibling; }
+      })(rootEl[fiberKey]);
+
+      if (DEBUG) console.log("[" + PLUGIN_NAME + "] purgeMessageCache:", purged);
+    } catch (e) {
+      if (DEBUG) console.warn("[" + PLUGIN_NAME + "] purge failed:", e);
+    }
+  }
+
+  /**
    * 调用后端 API
    * @param {string} method - HTTP 方法
    * @param {string} path - API 路径
@@ -175,9 +266,19 @@
 
   /**
    * 刷新当前页面（延迟 2 秒，让用户看到提示）
+   *
+   * @param {string} sessionId - 当前会话 ID（传给 purgeMessageCache）
+   * @param {boolean} purge - 是否在 reload 前清宿主本地残留（v2.5.0）。
+   *   rewind/delete 等破坏性操作传 true（默认）：清 pending_user_msg 与 React
+   *   内存消息 store，防旧气泡复活；fork/regen 传 false——regen 后续还有
+   *   模拟发送新消息，清缓存会干扰新 run 的流式渲染。
    */
-  function refreshPage() {
+  function refreshPage(sessionId, purge) {
+    if (purge === undefined) purge = true;
     setTimeout(function () {
+      if (purge) {
+        try { purgeMessageCache(sessionId || getSessionId()); } catch (_) {}
+      }
       window.location.reload();
     }, 2000);
   }
@@ -204,6 +305,12 @@
           showToast("ctx.data.created_at 不存在", "error");
           return;
         }
+        // v2.5.4：流式中刷新页面，气泡可能既无 original_id 且 created_at=0
+        // （消息尚未持久化）——任何定位方式都无效，直接提示等待，不发后端请求
+        if (Number(createdAt) === 0) {
+          showToast("找不到消息：agent 正在流式输出，请等回复完成后刷新网页再试", "error");
+          return;
+        }
 
         if (!confirm("确认要回退到该消息（删除之后所有消息）吗？")) return;
 
@@ -214,12 +321,24 @@
         }
         var userInfo = getUserSessionInfo();
         var originalId = getOriginalId(ctx);
+        var role = getBubbleRole(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
+          role: role,
         };
+        // v2.5.3：assistant 刷新前（无 original_id）走区间匹配，completed_at 必填
+        if (role === "assistant" && !originalId) {
+          var completedAt = ctx.data.completed_at;
+          if (completedAt === undefined || completedAt === null ||
+              String(completedAt).trim() === "") {
+            showToast("completed_at 缺失：官方可能修改了消息结构，请联系开发者检查", "error");
+            return;
+          }
+          params.completed_at = String(completedAt);
+        }
         if (originalId) {
           params.original_id = originalId;
         }
@@ -238,7 +357,7 @@
                   }
                 } catch (_) {}
               }
-              refreshPage();
+              refreshPage(sessionId);
             } else {
               var detail = result ? (result.detail || JSON.stringify(result)) : "未知错误";
               showToast("回退失败: " + detail, "error");
@@ -268,6 +387,12 @@
           showToast("ctx.data.created_at 不存在", "error");
           return;
         }
+        // v2.5.4：流式中刷新页面，气泡可能既无 original_id 且 created_at=0
+        // （消息尚未持久化）——任何定位方式都无效，直接提示等待，不发后端请求
+        if (Number(createdAt) === 0) {
+          showToast("找不到消息：agent 正在流式输出，请等回复完成后刷新网页再试", "error");
+          return;
+        }
 
         if (!confirm("确认要从此处分叉新会话吗？")) return;
 
@@ -278,12 +403,24 @@
         }
         var userInfo = getUserSessionInfo();
         var originalId = getOriginalId(ctx);
+        var role = getBubbleRole(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
+          role: role,
         };
+        // v2.5.3：assistant 刷新前（无 original_id）走区间匹配，completed_at 必填
+        if (role === "assistant" && !originalId) {
+          var completedAt = ctx.data.completed_at;
+          if (completedAt === undefined || completedAt === null ||
+              String(completedAt).trim() === "") {
+            showToast("completed_at 缺失：官方可能修改了消息结构，请联系开发者检查", "error");
+            return;
+          }
+          params.completed_at = String(completedAt);
+        }
         if (originalId) {
           params.original_id = originalId;
         }
@@ -293,7 +430,7 @@
             if (result && result.success) {
               var name = result.session_name || "新会话";
               showToast("🍴 已分叉: " + name + "，2秒后刷新", "success");
-              refreshPage();
+              refreshPage(sessionId, false);
             } else {
               var detail = result ? (result.detail || JSON.stringify(result)) : "未知错误";
               showToast("分叉失败: " + detail, "error");
@@ -323,6 +460,12 @@
           showToast("ctx.data.created_at 不存在", "error");
           return;
         }
+        // v2.5.4：流式中刷新页面，气泡可能既无 original_id 且 created_at=0
+        // （消息尚未持久化）——任何定位方式都无效，直接提示等待，不发后端请求
+        if (Number(createdAt) === 0) {
+          showToast("找不到消息：agent 正在流式输出，请等回复完成后刷新网页再试", "error");
+          return;
+        }
 
         if (!confirm("确认要删除该轮对话（用户消息+助手回复）吗？")) return;
 
@@ -333,12 +476,24 @@
         }
         var userInfo = getUserSessionInfo();
         var originalId = getOriginalId(ctx);
+        var role = getBubbleRole(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
+          role: role,
         };
+        // v2.5.3：assistant 刷新前（无 original_id）走区间匹配，completed_at 必填
+        if (role === "assistant" && !originalId) {
+          var completedAt = ctx.data.completed_at;
+          if (completedAt === undefined || completedAt === null ||
+              String(completedAt).trim() === "") {
+            showToast("completed_at 缺失：官方可能修改了消息结构，请联系开发者检查", "error");
+            return;
+          }
+          params.completed_at = String(completedAt);
+        }
         if (originalId) {
           params.original_id = originalId;
         }
@@ -347,7 +502,7 @@
           .then(function (result) {
             if (result && result.success) {
               showToast("🗑 已删除", "success");
-              refreshPage();
+              refreshPage(sessionId);
             } else {
               var detail = result ? (result.detail || JSON.stringify(result)) : "未知错误";
               showToast("删除失败: " + detail, "error");
@@ -377,6 +532,12 @@
           showToast("ctx.data.created_at 不存在", "error");
           return;
         }
+        // v2.5.4：流式中刷新页面，气泡可能既无 original_id 且 created_at=0
+        // （消息尚未持久化）——任何定位方式都无效，直接提示等待，不发后端请求
+        if (Number(createdAt) === 0) {
+          showToast("找不到消息：agent 正在流式输出，请等回复完成后刷新网页再试", "error");
+          return;
+        }
 
         var sessionId = getSessionId();
         if (!sessionId) {
@@ -388,12 +549,24 @@
 
         if (!confirm("确认要重新生成该助手消息吗？")) return;
 
+        var role = getBubbleRole(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
+          role: role,
         };
+        // v2.5.3：assistant 刷新前（无 original_id）走区间匹配，completed_at 必填
+        if (role === "assistant" && !originalId) {
+          var completedAt = ctx.data.completed_at;
+          if (completedAt === undefined || completedAt === null ||
+              String(completedAt).trim() === "") {
+            showToast("completed_at 缺失：官方可能修改了消息结构，请联系开发者检查", "error");
+            return;
+          }
+          params.completed_at = String(completedAt);
+        }
         if (originalId) {
           params.original_id = originalId;
         }
@@ -432,7 +605,7 @@
                     setTimeout(function() {
                       sendBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
                     }, 50);
-                    setTimeout(refreshPage, 1500);
+                    setTimeout(function () { refreshPage(sessionId, false); }, 1500);
                   } else if (attempt < maxAttempts) {
                     attempt++;
                     setTimeout(tryClick, 100);
@@ -470,6 +643,12 @@
           showToast("ctx.data.created_at 不存在", "error");
           return;
         }
+        // v2.5.4：流式中刷新页面，气泡可能既无 original_id 且 created_at=0
+        // （消息尚未持久化）——任何定位方式都无效，直接提示等待，不发后端请求
+        if (Number(createdAt) === 0) {
+          showToast("找不到消息：agent 正在流式输出，请等回复完成后刷新网页再试", "error");
+          return;
+        }
 
         var sessionId = getSessionId();
         if (!sessionId) {
@@ -480,12 +659,24 @@
         var originalId = getOriginalId(ctx);
 
         // 调后端 API
+        var role = getBubbleRole(ctx);
         var params = {
           session_id: sessionId,
           user_id: userInfo.user_id,
           channel: userInfo.channel,
           created_at: String(createdAt),
+          role: role,
         };
+        // v2.5.3：assistant 刷新前（无 original_id）走区间匹配，completed_at 必填
+        if (role === "assistant" && !originalId) {
+          var completedAt = ctx.data.completed_at;
+          if (completedAt === undefined || completedAt === null ||
+              String(completedAt).trim() === "") {
+            showToast("completed_at 缺失：官方可能修改了消息结构，请联系开发者检查", "error");
+            return;
+          }
+          params.completed_at = String(completedAt);
+        }
         if (originalId) {
           params.original_id = originalId;
         }

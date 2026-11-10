@@ -48,11 +48,27 @@
 
 ## 📦 安装
 
+**方式一：Release 安装包（推荐）**
+
+先用打包脚本生成 zip（plugin.json 置于包根，含 README / LICENSE / CHANGELOG，排除测试与内部记忆）：
+
+```bash
+python scripts/build_release.py
+```
+
+再用 qwenpaw 命令安装：
+
+```bash
+qwenpaw plugin install dist/qwenpaw-plugin-session-tools-v2.5.4.zip --force
+```
+
+**方式二：源码目录**
+
 ```bash
 qwenpaw plugin install D:\Data\github_repo\qwenpaw-plugin-session-tools --force
 ```
 
-热安装后刷新页面（Ctrl+F5）生效。
+热安装后刷新页面（Ctrl+F5）生效。验证：`qwenpaw plugin list` 应看到「QwenPaw会话增强工具 (v2.5.4)」。
 
 ## 🏗️ 架构
 
@@ -61,6 +77,8 @@ session-tools/
 ├── plugin.json        # 插件元数据
 ├── plugin.py          # 入口文件：slash 命令 + HTTP API
 ├── session_ops.py     # 核心操作：会话文件读写、消息查找
+├── scripts/
+│   └── build_release.py  # 打包 zip 安装包
 ├── frontend/
 │   └── index.js       # WebUI 前端：按钮注册、API 调用
 └── README.md          # 本文件
@@ -68,7 +86,7 @@ session-tools/
 
 ### 关键设计
 
-- **消息定位**：优先使用 `original_id`（UUID，对应 session 文件 `msg.id`）精确匹配，不可用时回退到 `created_at` 时间戳秒级模糊匹配
+- **消息定位**：优先使用 `original_id`（UUID，对应 session 文件 `msg.id`）精确匹配，不可用时回退到 `created_at` 按角色定位（assistant 区间匹配 / user 渐进窗口，v2.5.3）
 - **Slash 命令**：通过 `register_slash_command()` 注册，返回 `Msg` 阻止 agent 继续，或返回 `None` 让 agent 继续处理
 - **HTTP API**：提供 RESTful API 供 WebUI 按钮调用
 - **会话操作**：`SessionOperator` 类封装会话文件读写，兼容新旧两种文件格式
@@ -76,16 +94,19 @@ session-tools/
 
 ## ⚙️ 工作原理
 
-### 消息定位：`original_id` 优先，`created_at` 回退
+### 消息定位：`original_id` 优先，`created_at` 按角色回退（v2.5.3）
 
-所有按钮优先使用 `ctx.data` 中的 `original_id` 精确匹配消息 UUID；旧版 QwenPaw 无 `original_id` 时回退到 `created_at`：
+所有按钮优先使用 `ctx.data` 中的 `original_id` 精确匹配消息 UUID；旧版 QwenPaw 无 `original_id` 时回退到 `created_at`，**不同角色用不同定位方法**：
 
 ```
 ctx.data.input[0].metadata.original_id  (用户气泡)  ┐
 ctx.data.output[0].metadata.original_id (助手气泡)  ┴→ 后端 find_message_by_id(msg_id=...)
                                                     → 按 session 文件 msg.id 精确匹配
 ctx.data.created_at (Unix秒数 / ISO字符串)          ─→ 后端 find_message_by_created_at()
-                                                    → 统一转 Unix 秒数，先严格匹配（同一秒），再 ±1 秒宽松匹配
+    ├─ assistant：区间匹配——msg.created_at ∈ [created_at, completed_at + 1s]
+    │   （助手消息顶层 created_at 是首段保存时刻，必然落在 [发送, 完成] 区间内，
+    │     区间随生成时长自适应，不受固定窗口限制；completed_at 缺失直接报错）
+    └─ user：渐进窗口 ±1s → ±2s → ±3s（每层先按 role 过滤再判定）
 多匹配时报 409 Conflict，未找到时报 404（提示刷新网页）
 → 返回消息索引 + 消息对象
 ```
@@ -153,7 +174,7 @@ ctx.data.created_at (Unix秒数 / ISO字符串)          ─→ 后端 find_mess
 
 - **运行目录**：`~/.qwenpaw/plugins/qwenpaw-plugin-session-tools/`
 - **插件类型**：`command`
-- **消息定位**：`created_at` 时间戳统一转 Unix 秒数，先严格匹配（同一秒）再 ±1 秒容差匹配，多匹配时报错
+- **消息定位**：`created_at` 统一转 Unix 秒数比较；assistant 用 `created_at ~ completed_at + 1s` 区间匹配（v2.5.3），user 用渐进窗口 ±1/2/3s，多匹配时报错
 - **输入框填值**：`nativeInputValueSetter`（React 受控组件兼容）
 - **发送按钮**：`button.qwenpaw-sender-actions-btn`，轮询点击（最多 1 秒）
 - **调试开关**：`localStorage.setItem('SessionTools.debug', 'true')`
@@ -162,7 +183,8 @@ ctx.data.created_at (Unix秒数 / ISO字符串)          ─→ 后端 find_mess
 ## 📝 注意事项
 
 - **修改后需要 Ctrl+F5 硬刷新**，浏览器可能缓存旧 JS
-- **`created_at` 先严格匹配再 ±1 秒容差**，同一秒内多条消息或相近时间多条消息时报 409 Conflict
+- **assistant 定位依赖 `ctx.data.completed_at`**（刷新前按钮上下文始终携带；缺失会直接报错提示开发者检查官方结构），user 气泡相近时间多条消息时报 409 Conflict
+- **流式中刷新网页后气泡可能既无 `original_id` 且 `created_at=0`**（消息尚未持久化）——前端直接提示等 agent 回复完成后刷新，不发请求（v2.5.4）
 - **🔄 regen 后 1.5 秒自动刷新**，等待 agent 生成回复；自动提交改用轮询机制（最多等 1 秒），兼容慢机器
 - **`/noreply` 不会触发 AI 回复**，仅记录用户消息
 
